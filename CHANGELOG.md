@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/hbdzh/miko-simulator/compare/v0.10.0...v0.11.0) (2026-11-20)
+
+
+### Features
+
+* bundle Magisk for offline full root ([8afa02e](https://github.com/hbdzh/miko-simulator/commit/8afa02ea5dad7c8dc424cb324b4d13697db69b94))
+
 ## 0.10.0 — miko 模拟器 (2026-11-20)
 
 ### 环境与安装
