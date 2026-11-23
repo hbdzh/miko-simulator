@@ -126,13 +126,49 @@ final class GameShortcutsStore: ObservableObject {
     @Published private(set) var capture: Int?
     @Published private(set) var loaded = false
     private var location: URL?
+    @Published private(set) var scriptSlots: [String: String] = [:]
+    private var scriptLocation: URL?
+    private var scriptSlotsReadable = false
 
     func load(dataDirectory: String, device: String) {
         let id = UUID(uuidString: device)?.uuidString.lowercased() ?? device
         location = URL(fileURLWithPath: dataDirectory, isDirectory: true)
             .appendingPathComponent("game-shortcuts", isDirectory: true)
             .appendingPathComponent("\(id).json")
+        scriptLocation = URL(fileURLWithPath: dataDirectory, isDirectory: true)
+            .appendingPathComponent("script-shortcuts", isDirectory: true).appendingPathComponent("\(id).json")
+        loadScriptSlots()
         reload()
+    }
+
+    private func loadScriptSlots() {
+        scriptSlots = [:]; scriptSlotsReadable = false
+        guard let url = scriptLocation else { return }
+        if !FileManager.default.fileExists(atPath: url.path) { scriptSlotsReadable = true; return }
+        guard let data = try? Data(contentsOf: url), let slots = try? JSONDecoder().decode([String: String].self, from: data),
+              slots.allSatisfy({ Int($0.key).map { (1...9).contains($0) } == true && UUID(uuidString: $0.value) != nil }) else { return }
+        scriptSlots = slots; scriptSlotsReadable = true
+    }
+
+    func setScriptSlot(_ slot: Int?, script: String) -> Bool {
+        guard scriptSlotsReadable, let url = scriptLocation, UUID(uuidString: script) != nil else { return false }
+        var next = scriptSlots.filter { $0.value != script }
+        if let slot {
+            guard (1...9).contains(slot), next[String(slot)] == nil,
+                  let binding = ShortcutBinding.make(key: String(slot), command: false, control: true, shift: false, alt: true),
+                  shortcuts.lookup(binding) == nil else { return false }
+            next[String(slot)] = script
+        }
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try JSONEncoder().encode(next).write(to: url, options: .atomic)
+            scriptSlots = next; return true
+        } catch { return false }
+    }
+
+    func scriptForShortcut(key: String, command: Bool, control: Bool, shift: Bool, alt: Bool) -> String? {
+        guard !command, control, !shift, alt else { return nil }
+        return scriptSlots[key]
     }
 
     private func reload() {
@@ -168,6 +204,7 @@ final class GameShortcutsStore: ObservableObject {
         guard let index = capture else { return nil }
         guard let binding = ShortcutBinding.make(key: key, command: command, control: control,
                                                 shift: shift, alt: alt) else { return .invalidChord }
+        if scriptForShortcut(key: binding.key, command: binding.command, control: binding.control, shift: binding.shift, alt: binding.alt) != nil { return .conflict }
         var updated = shortcuts
         guard updated.assign(index, binding) else { return .conflict }
         guard save(updated) else { return .cannotSave }
@@ -208,5 +245,33 @@ final class GameShortcutsStore: ObservableObject {
         case .overlay: return t("调试浮层", "Debug overlay", language)
         case .advanced: return t("高级工具", "Advanced tools", language)
         }
+    }
+}
+
+/// Global script slots belong to the app, so one chord cannot target two devices.
+struct GlobalScriptTarget: Codable, Equatable {
+    var device: String
+    var script: String
+}
+struct GlobalScriptBindings: Codable, Equatable {
+    var slots: [String: GlobalScriptTarget] = [:]
+    /// Physical number-row keys are stable when Shift changes their characters.
+    static func slot(keyCode: UInt16) -> String? {
+        [18:"1", 19:"2", 20:"3", 21:"4", 23:"5", 22:"6", 26:"7", 28:"8", 25:"9"][keyCode]
+    }
+    func validate() -> Bool {
+        slots.allSatisfy { key, value in
+            Int(key).map { (1...9).contains($0) } == true && UUID(uuidString:value.device) != nil && UUID(uuidString:value.script) != nil
+        }
+    }
+    mutating func set(_ slot: Int?, target: GlobalScriptTarget) -> Bool {
+        guard UUID(uuidString:target.device) != nil, UUID(uuidString:target.script) != nil else { return false }
+        var next = slots.filter { $0.value != target }
+        if let slot {
+            guard (1...9).contains(slot), next[String(slot)] == nil else { return false }
+            next[String(slot)] = target
+        }
+        slots = next
+        return true
     }
 }

@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use clap::{CommandFactory, Parser};
 use cli::{
-    AudioCmd, BaseCmd, CacheCmd, CertCmd, Cli, Cmd, DaemonCmd, DeviceCmd, GamepadCmd, Hardware,
-    ImageCmd, InputSyncCmd, JobsCmd, NetworkCmd, PoolCmd, ProfileCmd, ProxyCmd, RootCmd, SdkCmd,
-    Selection, SettingsCmd, SnapshotCmd, SyncCmd,
+    AudioCmd, BaseCmd, CacheCmd, CertCmd, Cli, Cmd, DaemonCmd, DeviceCmd, FlowCmd, GamepadCmd,
+    Hardware, ImageCmd, InputSyncCmd, JobsCmd, NetworkCmd, PoolCmd, ProfileCmd, ProxyCmd, RootCmd,
+    SdkCmd, Selection, SettingsCmd, SnapshotCmd, SyncCmd,
 };
 use miko_client::{Client, SpawnOptions};
 use miko_core::{ErrorCode, Job, JobState, MikoError, MikoPaths, MikoResult};
@@ -947,6 +947,46 @@ async fn dispatch(c: &Client, cmd: Cmd, out: Out) -> MikoResult<()> {
             out.ok(&serde_json::to_value(&j).unwrap_or(Value::Null), |_| {
                 format!("Cancelling {job}.")
             });
+        }
+        Cmd::Flow { cmd } => {
+            let value = match cmd {
+                FlowCmd::Run {
+                    file,
+                    device,
+                    paused,
+                    screenshots,
+                } => {
+                    let bytes = std::fs::read(&file).map_err(|e| {
+                        MikoError::usage(format!("reading {}: {e}", file.display()))
+                    })?;
+                    let flow: Value = serde_json::from_slice(&bytes)
+                        .map_err(|e| MikoError::usage(format!("invalid workflow JSON: {e}")))?;
+                    c.call("flow.validate", json!({"flow":flow})).await?;
+                    let mut results = Vec::new();
+                    let mut failed = false;
+                    for name in device {
+                        match c.call("flow.run", json!({"device":name,"flow":flow,"start_paused":paused,"screenshots":screenshots})).await {
+                            Ok(job) => results.push(json!({"device":name,"job":job})),
+                            Err(error) => { failed = true; results.push(json!({"device":name,"error":error})); },
+                        }
+                    }
+                    if failed {
+                        return Err(MikoError::unexpected(
+                            "one or more workflow jobs could not be started",
+                        )
+                        .with_data(json!({"devices":results})));
+                    }
+                    json!(results)
+                }
+                FlowCmd::Status { device } => {
+                    c.call("flow.status", json!({"device":device})).await?
+                }
+                FlowCmd::Control { device, command } => {
+                    c.call("flow.control", json!({"device":device,"command":command}))
+                        .await?
+                }
+            };
+            out.ok(&value, output::pretty);
         }
         Cmd::Pool { cmd } => pool(c, out, cmd).await?,
         Cmd::Base { cmd } => base(c, out, cmd).await?,

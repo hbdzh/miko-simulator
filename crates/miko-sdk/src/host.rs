@@ -216,6 +216,34 @@ pub fn process_footprint_mb(pid: u32) -> Option<u64> {
     footprint_of(&process_tree(pid))
 }
 
+/// Sample the emulator launcher and its direct children. 100% is one core.
+pub fn process_cpu_percent(pid: u32) -> Option<u32> {
+    let pids = process_tree(pid)
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let output = Command::new("ps")
+        .args(["-p", &pids, "-o", "%cpu="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let output = String::from_utf8(output.stdout).ok()?;
+    parse_ps_cpu(&output)
+}
+
+fn parse_ps_cpu(output: &str) -> Option<u32> {
+    let mut values = output.split_whitespace().map(str::parse::<f64>);
+    let first = values.next()?.ok()?;
+    let sum = values.try_fold(first, |sum, value| Some(sum + value.ok()?))?;
+    if !sum.is_finite() || sum < 0.0 {
+        return None;
+    }
+    Some(sum.round() as u32)
+}
+
 /// `pid` and its direct children (the emulator launcher and its QEMU).
 pub fn process_tree(pid: u32) -> Vec<u32> {
     let mut pids = vec![pid];
@@ -300,6 +328,13 @@ pub fn parse_top_mem(v: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_sample_sums_processes() {
+        assert_eq!(parse_ps_cpu(" 0.5\n 124.7\n"), Some(125));
+        assert_eq!(parse_ps_cpu(""), None);
+        assert_eq!(parse_ps_cpu("not-a-number"), None);
+    }
 
     const VM_STAT: &str = "\
 Mach Virtual Memory Statistics: (page size of 16384 bytes)

@@ -236,6 +236,10 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
     async fn footprint_mb(&self, _instance: &InstanceInfo) -> Option<u64> {
         None
     }
+    /// Sampled host CPU percentage for the instance process tree.
+    async fn cpu_percent(&self, _instance: &InstanceInfo) -> Option<u32> {
+        None
+    }
 }
 
 #[cfg(test)]

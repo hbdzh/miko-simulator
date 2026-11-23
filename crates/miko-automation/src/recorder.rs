@@ -198,7 +198,10 @@ impl Recorder {
                     self.keys.remove(key);
                 }
             }
-            Event::Text { .. } | Event::Paste { .. } | Event::ToolKey { .. } => {}
+            Event::Text { .. }
+            | Event::Paste { .. }
+            | Event::ToolKey { .. }
+            | Event::ScriptCall { .. } => {}
         }
     }
 }

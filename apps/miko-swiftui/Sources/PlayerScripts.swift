@@ -32,6 +32,31 @@ struct PlayerScriptDisplay: Codable, Equatable {
     var height: Int
 }
 
+struct PlayerScriptActionRow: Decodable, Identifiable {
+    struct Point: Decodable { let x: Double; let y: Double }
+    let index: Int
+    let kind: String
+    let detail: String
+    let start_ms: Int
+    let end_ms: Int
+    let wait_ms: Int?
+    let point: Point?
+    let endpoint: Point?
+    var id: Int { index }
+
+    func title(language: Int) -> String {
+        switch kind {
+        case "gesture": return detail == "tap" ? t("点击", "Tap", language) : t("滑动或手势", "Swipe or gesture", language)
+        case "key": return t("按键：", "Key: ", language) + detail
+        case "text": return t("输入文本", "Enter text", language)
+        case "paste": return t("粘贴文本", "Paste text", language)
+        case "tool_key": return t("设备按键：", "Device key: ", language) + detail
+        case "script_call": return t("调用脚本：", "Run script: ", language) + detail
+        default: return t("未知动作", "Unknown action", language)
+        }
+    }
+}
+
 /// Playback defaults for one run (`PlaybackOptions` on the bridge side).
 /// `mode` is `count`, `duration` or `infinite`; irrelevant fields are sent as 0,
 /// which is what the v1 contract defines.
@@ -150,6 +175,16 @@ enum PlayerScriptText {
     /// Maps the bridge's error codes to bilingual copy; unknown messages pass
     /// through (they are already the daemon/bridge English fallback).
     static func error(code: String?, message: String?, language: Int) -> String {
+        switch message {
+        case "The script changed elsewhere; reopen it before editing", "The open script changed; reopen it before editing":
+            return t("录制已发生变化，请重新读取后再编辑。", "The recording changed. Reload it before editing.", language)
+        case "cannot change a wait inside overlapping actions":
+            return t("无法修改重叠动作期间的等待。", "Cannot change a wait inside overlapping actions.", language)
+        case "the recording contains no events":
+            return t("不能删除最后一个动作。", "The last action cannot be deleted.", language)
+        default:
+            break
+        }
         switch code {
         case "script.busy":
             return t("操作录制正忙，请先停止当前录制或回放。",
@@ -396,6 +431,7 @@ struct PlayerScriptsView: View {
     @State private var search = ""
     @State private var selection: String?
     @State private var optionsFor: String?
+    @State private var editingScript: PlayerScriptSummary?
     @AppStorage("miko.script.playback.mode") private var playbackMode = PlaybackMode.count.rawValue
     @AppStorage("miko.script.playback.count") private var playbackCount = 1
     @AppStorage("miko.script.playback.seconds") private var playbackSeconds = 60
@@ -456,6 +492,9 @@ struct PlayerScriptsView: View {
         .onReceive(NotificationCenter.default.publisher(for: .playerScriptsChanged)) { _ in
             if transport.linkState.isRunning { transport.scriptList() }
         }
+        .sheet(item: $editingScript) { script in
+            ScriptActionsEditor(transport: transport, script: script)
+        }
     }
     private func row(_ script: PlayerScriptSummary) -> some View {
         HStack(spacing: 12) {
@@ -484,6 +523,11 @@ struct PlayerScriptsView: View {
                                            seconds: $playbackSeconds, interval: $playbackInterval, speed: $playbackSpeed)
                 }
             Menu {
+                Button(t("编辑动作…", "Edit actions…", language)) { editingScript = script }
+                ScriptShortcutMenu(store: transport.shortcuts, script: script.id, language: language, onError: { transport.onStatus?(t("快捷键已占用或无法保存。", "Shortcut is in use or could not be saved.", language)) })
+                if let device = transport.device {
+                    GlobalScriptShortcutMenu(store: .shared, device: device, script: script.id, language: language) { text in transport.onStatus?(text) }
+                }
                 Button(t("重命名…", "Rename…", language)) { rename(script) }
                 Button(t("导出…", "Export…", language)) { exportScript(script) }
                 Divider()
@@ -495,6 +539,7 @@ struct PlayerScriptsView: View {
         .padding(.vertical, 5)
         .contextMenu {
             Button(t("回放", "Play", language)) { perform?(.play(script, options)) }
+            Button(t("编辑动作…", "Edit actions…", language)) { editingScript = script }
             Button(t("重命名…", "Rename…", language)) { rename(script) }
             Button(t("导出…", "Export…", language)) { exportScript(script) }
             Divider()
@@ -517,6 +562,177 @@ struct PlayerScriptsView: View {
         transport.scriptExport(id: script.id, path: url.path)
     }
 
+}
+
+private struct ScriptShortcutMenu: View {
+    @ObservedObject var store: GameShortcutsStore
+    let script: String
+    let language: Int
+    let onError: () -> Void
+    var body: some View {
+        Menu(t("应用内快捷键", "In-app shortcut", language)) {
+            ForEach(1...9, id: \.self) { slot in
+                Button {
+                    if !store.setScriptSlot(slot, script: script) { onError() }
+                } label: {
+                    if store.scriptSlots[String(slot)] == script { Label("⌃⌥\(slot)", systemImage: "checkmark") }
+                    else { Text("⌃⌥\(slot)") }
+                }
+            }
+            Button(t("移除快捷键", "Remove shortcut", language)) {
+                if !store.setScriptSlot(nil, script: script) { onError() }
+            }
+        }
+    }
+}
+
+private struct GlobalScriptShortcutMenu: View {
+    @ObservedObject var store: GlobalScriptShortcuts
+    let device: String
+    let script: String
+    let language: Int
+    let onStatus: (String) -> Void
+    var body: some View {
+        Menu(t("全局快捷键", "Global shortcut", language)) {
+            ForEach(1...9, id: \.self) { slot in
+                Button {
+                    if !store.set(slot: slot, device: device, script: script) {
+                        onStatus(t("全局快捷键已占用或无法保存。", "Global shortcut is in use or could not be saved.", language))
+                    } else if !store.permissionGranted {
+                        onStatus(t("已保存快捷键；请在系统设置中允许辅助功能。", "Shortcut saved; allow Accessibility in System Settings.", language))
+                    }
+                } label: {
+                    if store.bindings.slots[String(slot)] == GlobalScriptTarget(device: device.lowercased(), script: script.lowercased()) {
+                        Label("⌃⌥⇧\(slot)", systemImage: "checkmark")
+                    } else { Text("⌃⌥⇧\(slot)") }
+                }
+            }
+            Button(t("移除全局快捷键", "Remove global shortcut", language)) {
+                if !store.set(slot: nil, device: device, script: script) {
+                    onStatus(t("无法保存全局快捷键。", "Could not save the global shortcut.", language))
+                }
+            }
+        }
+    }
+}
+
+private struct ScriptActionsEditor: View {
+    @ObservedObject var transport: PlayerTransport
+    let script: PlayerScriptSummary
+    @Environment(\.dismiss) private var dismiss
+    private var language: Int { transport.language }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(t("编辑动作", "Edit actions", language)).font(.headline)
+            Text(script.name).foregroundStyle(.secondary)
+            if let error = transport.scriptError {
+                HStack {
+                    Text(error).foregroundStyle(.red)
+                    Spacer()
+                    Button(t("重新读取", "Reload", language)) { transport.scriptActionsGet(id: script.id) }
+                }
+            }
+            if transport.scriptEditorID == script.id {
+                List {
+                    ForEach(transport.scriptActions) { action in
+                        ScriptActionEditorRow(transport: transport, scriptID: script.id, action: action)
+                            .listRowBackground(transport.scriptPlaybackID == script.id && transport.scriptPlaybackAction == action.index ? Color.accentColor.opacity(0.18) : Color.clear)
+                    }.onMove { source, destination in
+                        guard let from = source.first else { return }
+                        let to = destination > from ? destination - 1 : destination
+                        if from != to { transport.scriptActionMove(id: script.id, from: from, to: to) }
+                    }
+                }
+            } else {
+                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            Text(t("拖拽调整顺序；重叠动作会一起移动，不能单独修改时长。修改立即保存。", "Drag to reorder; overlapping actions move together and cannot be resized individually. Edits save immediately.", language))
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Menu(t("添加脚本片段", "Add script fragment", language)) {
+                    ForEach(transport.scripts.filter { $0.id != script.id }) { fragment in
+                        Button(fragment.name) { transport.scriptActionCall(id: script.id, fragment: fragment.id) }
+                    }
+                }.disabled(transport.scripts.allSatisfy { $0.id == script.id })
+                Spacer(); Button(t("完成", "Done", language)) { dismiss() }
+            }
+        }
+        .padding(20).frame(minWidth: 570, minHeight: 400)
+        .onAppear { transport.scriptActionsGet(id: script.id) }
+    }
+}
+
+private struct ScriptActionEditorRow: View {
+    @ObservedObject var transport: PlayerTransport
+    let scriptID: String
+    let action: PlayerScriptActionRow
+    @State private var waitText = ""
+    @State private var confirmDelete = false
+    @State private var xText = ""
+    @State private var yText = ""
+    @State private var endXText = ""
+    @State private var endYText = ""
+    @State private var durationText = ""
+    private var language: Int { transport.language }
+    private var wait: Int? {
+        guard let value = Int(waitText), (0...86_400_000).contains(value) else { return nil }
+        return value
+    }
+    var body: some View {
+        VStack(alignment: .leading) {
+        HStack {
+            VStack(alignment: .leading) {
+                Text(action.kind == "script_call" ? t("调用脚本：", "Run script: ", language) + (transport.scripts.first(where: { $0.id == action.detail })?.name ?? action.detail) : action.title(language: language))
+                Text("\(action.start_ms)–\(action.end_ms) ms").font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if action.wait_ms != nil {
+                Text(t("等待", "Wait", language)).font(.caption)
+                TextField("ms", text: $waitText).frame(width: 70)
+                Text("ms").font(.caption)
+                Button(t("应用", "Apply", language)) {
+                    if let wait { transport.scriptActionWait(id: scriptID, index: action.index, milliseconds: wait) }
+                }.disabled(wait == nil || wait == action.wait_ms)
+            }
+            Button(role: .destructive) { confirmDelete = true } label: {
+                Image(systemName: "trash")
+            }.help(t("删除动作", "Delete action", language))
+        }
+        if action.point != nil {
+            HStack {
+                Text(t("起点", "From", language)); TextField("X", text: $xText).frame(width: 48); TextField("Y", text: $yText).frame(width: 48)
+                Text(t("终点", "To", language)); TextField("X", text: $endXText).frame(width: 48); TextField("Y", text: $endYText).frame(width: 48)
+                Text(t("时长", "Duration", language)); TextField("ms", text: $durationText).frame(width: 65); Text("ms")
+                Button(t("应用", "Apply", language)) {
+                    if let x = Double(xText), let y = Double(yText), let endX = Double(endXText), let endY = Double(endYText), let duration = Int(durationText), (0...86_400_000).contains(duration) {
+                        transport.scriptActionGesture(id: scriptID, index: action.index, x: x, y: y, endX: endX, endY: endY, duration: duration)
+                    }
+                }
+            }.font(.caption)
+        }
+        }
+        .confirmationDialog(t("删除这个动作？", "Delete this action?", language), isPresented: $confirmDelete) {
+            Button(t("删除", "Delete", language), role: .destructive) {
+                transport.scriptActionDelete(id: scriptID, index: action.index)
+            }
+            Button(t("取消", "Cancel", language), role: .cancel) { }
+        }
+        .onAppear { loadFields() }
+        .onChange(of: action.wait_ms) { value in waitText = value.map(String.init) ?? "" }
+        .onChange(of: action.point?.x) { _ in loadFields() }
+        .onChange(of: action.point?.y) { _ in loadFields() }
+        .onChange(of: action.endpoint?.x) { _ in loadFields() }
+        .onChange(of: action.endpoint?.y) { _ in loadFields() }
+        .onChange(of: action.end_ms - action.start_ms) { _ in loadFields() }
+    }
+
+    private func loadFields() {
+        waitText = action.wait_ms.map(String.init) ?? ""
+        if let point = action.point { xText = String(format: "%.4f", point.x); yText = String(format: "%.4f", point.y) }
+        if let point = action.endpoint { endXText = String(format: "%.4f", point.x); endYText = String(format: "%.4f", point.y) }
+        durationText = String(action.end_ms - action.start_ms)
+    }
 }
 
 struct PlaybackOptionsPopover: View {

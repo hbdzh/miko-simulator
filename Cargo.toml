@@ -22,7 +22,7 @@ members = [
 default-members = ["apps/miko"]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 rust-version = "1.99"
 license = "Apache-2.0"
@@ -82,6 +82,7 @@ clap_complete = "4.6"
 rustyline = { version = "19.0", default-features = false, features = ["with-file-history"] }
 rmcp = "3.5"
 png = "0.18"
+roxmltree = "0.21"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 sha1 = "0.11"
 

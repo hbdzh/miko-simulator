@@ -11,6 +11,19 @@ private let sidebarWidth: CGFloat = WbLayout.windowDeviceToolbarWidth
 private let mappingPanelWidth: CGFloat = 288
 private let playerTitlebarHeight: CGFloat = sidebarWidth
 
+// AppKit forbids changing an accessory view's origin while it is attached.
+// Keep the button's intrinsic layout inside a fixed-size accessory container.
+private final class FixedTitlebarView: NSView {
+    private let size: NSSize
+    override init(frame frameRect: NSRect) {
+        size = frameRect.size
+        super.init(frame: frameRect)
+    }
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override var intrinsicContentSize: NSSize { size }
+}
+
 final class SidebarState: ObservableObject {
     @Published var visible = true
 }
@@ -210,6 +223,13 @@ final class GameWindowController: NSObject, NSWindowDelegate {
         return NSSize(width: round(height * aspect) + side, height: height + decorations)
     }
 
+    func gridLayoutSpec() -> DeviceWindowLayoutSpec? {
+        guard let window, !window.styleMask.contains(.fullScreen) else { return nil }
+        return DeviceWindowLayoutSpec(aspect: aspect, side: side,
+                                      decorations: window.frame.height - window.contentLayoutRect.height + titlebarInset,
+                                      minimumHeight: 180)
+    }
+
     @objc private func toggleSidebar() {
         panelAnimation?.cancel()
         panelAnimation = nil
@@ -254,7 +274,10 @@ final class GameWindowController: NSObject, NSWindowDelegate {
         button.target = self
         button.action = #selector(toggleSidebar)
         button.setAccessibilityRole(.button)
-        accessory.view = button
+        let container = FixedTitlebarView(frame: button.frame)
+        button.autoresizingMask = [.width, .height]
+        container.addSubview(button)
+        accessory.view = container
         sidebarButton = button
         window.addTitlebarAccessoryViewController(accessory)
         updateSidebarButton()
@@ -323,6 +346,10 @@ final class GameWindowController: NSObject, NSWindowDelegate {
                 onWarning?(windowStateMessage(error))
             }
             transport.shortcuts.load(dataDirectory: dataDirectory, device: device)
+            GlobalScriptShortcuts.shared.configure(dataDirectory: dataDirectory)
+            GlobalScriptShortcuts.shared.register(device: device) { [weak transport = self.transport] script in
+                transport?.scriptPlayDefault(id: script)
+            }
             if ProcessInfo.processInfo.environment["MIKO_PLAYER_FIXTURE"] == "1" {
                 // The fixture has no daemon connect_info response to supply
                 // this path. Keep local mapping editing usable in its temp home.
@@ -370,7 +397,7 @@ final class GameWindowController: NSObject, NSWindowDelegate {
         titleLabel = title
         NSLayoutConstraint.activate([
             title.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 78),
-            title.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -(sidebarWidth + 80)),
+            title.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -(sidebarWidth + 112)),
             title.centerYAnchor.constraint(equalTo: background.topAnchor, constant: playerTitlebarHeight / 2)
         ])
         titlebarInset = max(0, playerTitlebarHeight - (window.frame.height - window.contentLayoutRect.height))
@@ -417,6 +444,10 @@ final class GameWindowController: NSObject, NSWindowDelegate {
         transport.onDataDirectory = { [weak self] path in
             guard let self else { return }
             self.transport.shortcuts.load(dataDirectory: path, device: device)
+            GlobalScriptShortcuts.shared.configure(dataDirectory: path)
+            GlobalScriptShortcuts.shared.register(device: device) { [weak transport = self.transport] script in
+                transport?.scriptPlayDefault(id: script)
+            }
         }
         transport.onStartDevice = onStartDevice
         if let saved, let frame = restoredFrame(saved) {
@@ -553,10 +584,12 @@ final class GameWindowController: NSObject, NSWindowDelegate {
         let update: (Notification) -> Void = { [weak self] _ in self?.refreshDisplayVisibility() }
         for name in [NSWindow.didChangeOcclusionStateNotification,
                      NSWindow.didMiniaturizeNotification,
-                     NSWindow.didDeminiaturizeNotification] {
+                     NSWindow.didDeminiaturizeNotification,
+                     NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
             visibilityObservers.append(center.addObserver(forName: name, object: window, queue: .main, using: update))
         }
-        for name in [NSApplication.didHideNotification, NSApplication.didUnhideNotification] {
+        for name in [NSApplication.didHideNotification, NSApplication.didUnhideNotification,
+                     NSApplication.didBecomeActiveNotification, NSApplication.didResignActiveNotification] {
             visibilityObservers.append(center.addObserver(forName: name, object: nil, queue: .main, using: update))
         }
     }
@@ -569,6 +602,7 @@ final class GameWindowController: NSObject, NSWindowDelegate {
             transport.setDisplayVisible(false)
             return
         }
+        transport.setDisplayForeground(window.isKeyWindow && NSApp.isActive)
         let onScreen = window.isVisible && !window.isMiniaturized && window.isOnActiveSpace && !NSApp.isHidden
         guard onScreen else {
             transport.setDisplayVisible(false)
@@ -657,6 +691,10 @@ final class GameWindowController: NSObject, NSWindowDelegate {
         let characters = event.charactersIgnoringModifiers ?? ""
         let key = characters.lowercased()
         let language = transport.language
+        if GlobalScriptShortcuts.shared.handle(event) { return true }
+        if NSApp.modalWindow == nil, window?.attachedSheet == nil,
+           let screen = window?.firstResponder as? ScreenView,
+           screen.handleSkillCancelKeyDown(event) { return true }
         if transport.shortcuts.capture != nil {
             if event.keyCode == 53 {
                 transport.shortcuts.cancelCapture()
@@ -687,6 +725,13 @@ final class GameWindowController: NSObject, NSWindowDelegate {
         }
         if flags == [.command, .option], key == "0" {
             applyPixelPerfectSize()
+            return true
+        }
+        if !event.isARepeat, !transport.mapping.editing, !(window?.firstResponder is NSTextView), NSApp.modalWindow == nil,
+           window?.attachedSheet == nil,
+           let id = transport.shortcuts.scriptForShortcut(key: key, command: flags.contains(.command),
+                control: flags.contains(.control), shift: flags.contains(.shift), alt: flags.contains(.option)) {
+            transport.scriptPlayDefault(id: id)
             return true
         }
         if let binding = ShortcutBinding.make(key: characters,
@@ -755,6 +800,7 @@ final class GameWindowController: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        GlobalScriptShortcuts.shared.unregister(device: deviceID)
         saveState()
         removeMonitors()
         transport.setDisplayVisible(false)

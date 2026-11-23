@@ -33,6 +33,12 @@ enum MappingKey {
         return (33...126).contains(b) && !(97...122).contains(b)
     }
 
+    static func normalizeCancel(keyCode: UInt16, charactersIgnoringModifiers: String?) -> String? {
+        keyCode == 53 ? "ESC" : normalize(keyCode: keyCode, charactersIgnoringModifiers: charactersIgnoringModifiers)
+    }
+
+    static func isValidCancel(_ key: String) -> Bool { key == "ESC" || isValid(key) }
+
     static func displayLabel(_ key: String) -> String {
         switch key {
         case "SPACE": return "SPC"
@@ -65,6 +71,20 @@ enum JoystickPreset: Equatable {
 enum MappingPlacementMode: Equatable {
     case tap
     case joystick
+}
+
+/// A final path position must be sent before its touch is released.
+struct MappingPathStep {
+    let x: Double
+    let y: Double
+    let finished: Bool
+    let sendMove: Bool
+
+    init(binding: MappingBinding, elapsedMs: Double, previousX: Double, previousY: Double) {
+        let point = binding.pathPosition(elapsedMs: elapsedMs)
+        x = point.x; y = point.y; finished = point.finished
+        sendMove = point.x != previousX || point.y != previousY
+    }
 }
 
 enum KeyMappingFailure: Int, Equatable {
@@ -141,11 +161,156 @@ enum MappingTemplate: CaseIterable {
     }
 }
 
+enum MappingAction: String, Codable, CaseIterable {
+    case tap, holdToggle, repeatHold, repeatToggle, swipe, gesture, fpsView, skillAim, script
+
+    var stopsOnKeyUp: Bool { self == .tap || self == .repeatHold || self == .skillAim }
+    var holdsOwnershipBetweenTouches: Bool { self == .repeatHold || self == .repeatToggle || self == .fpsView }
+}
+
+/// The contact position for FPS view and MOBA aiming; the caller owns the
+/// paired down/up events and the mouse-capture lifetime.
+struct MappingAimState {
+    let originX: Double
+    let originY: Double
+    let sensitivity: Double
+    let radius: Double
+    private(set) var x: Double
+    private(set) var y: Double
+
+    init(binding: MappingBinding) {
+        originX = binding.x; originY = binding.y
+        x = binding.x; y = binding.y
+        sensitivity = binding.sensitivity; radius = binding.aimRadius
+    }
+
+    mutating func move(dx: Double, dy: Double, width: Double, height: Double) {
+        guard width > 0, height > 0 else { return }
+        var sx = (x - originX) * width + dx * sensitivity
+        var sy = (y - originY) * height + dy * sensitivity
+        let limit = min(width, height) * radius
+        let distance = hypot(sx, sy)
+        if distance > limit && distance > 0 { sx *= limit / distance; sy *= limit / distance }
+        x = min(1, max(0, originX + sx / width))
+        y = min(1, max(0, originY + sy / height))
+    }
+
+    func atLimit(width: Double, height: Double) -> Bool {
+        guard width > 0, height > 0 else { return false }
+        return hypot((x - originX) * width, (y - originY) * height) >= min(width, height) * radius * 0.98
+    }
+}
+
+enum MappingPressDecision: Equatable {
+    case start, stop, ignore
+    static func decide(action: MappingAction, active: Bool, physicalDown: Bool, isRepeat: Bool) -> Self {
+        if physicalDown || isRepeat { return .ignore }
+        if !active { return .start }
+        return action == .swipe || action == .gesture ? .ignore : .stop
+    }
+}
+
+struct MappingTracePoint: Codable, Equatable {
+    var x: Double
+    var y: Double
+    var tMs: Int
+}
+
+/// One repeating contact. The first down is sent by the caller before the
+/// cycle starts; stopping emits an up only when that contact is still down.
+struct MappingRepeatCycle {
+    private(set) var isDown = true
+    mutating func advance() -> Bool {
+        isDown.toggle()
+        return isDown
+    }
+    mutating func stopNeedsUp() -> Bool {
+        let result = isDown
+        isDown = false
+        return result
+    }
+}
+
 struct MappingBinding: Codable, Equatable {
     var key: String
     var x: Double
     var y: Double
     var rotation: Int
+    var action: MappingAction = .tap
+    var repeatIntervalMs: Int = 120
+    var endX: Double = 0.5
+    var endY: Double = 0.5
+    var durationMs: Int = 300
+    var trace: [MappingTracePoint] = []
+    var sensitivity: Double = 1
+    var aimRadius: Double = 0.2
+    var scriptID: String = ""
+    var cancelKey: String?
+    func cancelsSkill(with key: String) -> Bool { action == .skillAim && cancelKey == key }
+
+    enum CodingKeys: String, CodingKey { case key, x, y, rotation, action, repeatIntervalMs, endX, endY, durationMs, trace, sensitivity, aimRadius, scriptID, cancelKey }
+    init(key: String, x: Double, y: Double, rotation: Int, action: MappingAction = .tap, repeatIntervalMs: Int = 120) {
+        self.key = key; self.x = x; self.y = y; self.rotation = rotation
+        self.action = action; self.repeatIntervalMs = repeatIntervalMs
+    }
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        key = try container.decode(String.self, forKey: .key)
+        x = try container.decode(Double.self, forKey: .x)
+        y = try container.decode(Double.self, forKey: .y)
+        rotation = try container.decode(Int.self, forKey: .rotation)
+        action = try container.decodeIfPresent(MappingAction.self, forKey: .action) ?? .tap
+        repeatIntervalMs = try container.decodeIfPresent(Int.self, forKey: .repeatIntervalMs) ?? 120
+        endX = try container.decodeIfPresent(Double.self, forKey: .endX) ?? 0.5
+        endY = try container.decodeIfPresent(Double.self, forKey: .endY) ?? 0.5
+        durationMs = try container.decodeIfPresent(Int.self, forKey: .durationMs) ?? 300
+        trace = try container.decodeIfPresent([MappingTracePoint].self, forKey: .trace) ?? []
+        sensitivity = try container.decodeIfPresent(Double.self, forKey: .sensitivity) ?? 1
+        aimRadius = try container.decodeIfPresent(Double.self, forKey: .aimRadius) ?? 0.2
+        scriptID = try container.decodeIfPresent(String.self, forKey: .scriptID) ?? ""
+        cancelKey = try container.decodeIfPresent(String.self, forKey: .cancelKey)
+    }
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(key, forKey: .key); try container.encode(x, forKey: .x)
+        try container.encode(y, forKey: .y); try container.encode(rotation, forKey: .rotation)
+        if action != .tap {
+            try container.encode(action, forKey: .action)
+            try container.encode(repeatIntervalMs, forKey: .repeatIntervalMs)
+            if action == .swipe {
+                try container.encode(endX, forKey: .endX); try container.encode(endY, forKey: .endY)
+                try container.encode(durationMs, forKey: .durationMs)
+            }
+            if action == .gesture { try container.encode(trace, forKey: .trace) }
+            if action == .fpsView || action == .skillAim {
+                try container.encode(sensitivity, forKey: .sensitivity)
+                try container.encode(aimRadius, forKey: .aimRadius)
+                if action == .skillAim {
+                    try container.encode(endX, forKey: .endX); try container.encode(endY, forKey: .endY)
+                    try container.encodeIfPresent(cancelKey, forKey: .cancelKey)
+                }
+            }
+            if action == .script { try container.encode(scriptID, forKey: .scriptID) }
+        }
+    }
+
+    /// Interpolates recorded points on the normalized display at elapsed time.
+    func pathPosition(elapsedMs: Double) -> (x: Double, y: Double, finished: Bool) {
+        if action == .gesture, let first = trace.first, let last = trace.last {
+            if elapsedMs >= Double(last.tMs) { return (last.x, last.y, true) }
+            var previous = first
+            for point in trace.dropFirst() {
+                if elapsedMs <= Double(point.tMs), point.tMs > previous.tMs {
+                    let progress = max(0, min(1, (elapsedMs - Double(previous.tMs)) / Double(point.tMs - previous.tMs)))
+                    return (previous.x + (point.x - previous.x) * progress, previous.y + (point.y - previous.y) * progress, false)
+                }
+                previous = point
+            }
+            return (last.x, last.y, false)
+        }
+        let progress = max(0, min(1, elapsedMs / Double(max(1, durationMs))))
+        return (x + (endX - x) * progress, y + (endY - y) * progress, progress >= 1)
+    }
 }
 
 struct JoystickBinding: Codable, Equatable {
@@ -193,6 +358,11 @@ struct MappingPoint: Equatable {
     var rotation: Int
 }
 
+struct MappingTraceTarget: Equatable {
+    var key: String
+    var rotation: Int
+}
+
 struct MappingScheme: Codable, Equatable {
     var version: Int = 1
     var bindings: [MappingBinding] = []
@@ -227,14 +397,28 @@ struct MappingScheme: Codable, Equatable {
     var isEmpty: Bool { bindings.isEmpty && joysticks.isEmpty }
 
     func validate() -> Bool {
-        guard version == 1, bindings.count <= 256, joysticks.count <= 16 else { return false }
+        guard (1...5).contains(version), bindings.count <= 256, joysticks.count <= 16 else { return false }
         var seen = Set<String>()
         var bindingCounts: [Int: Int] = [:]
         var joystickCounts: [Int: Int] = [:]
         for b in bindings {
             guard MappingKey.isValid(b.key), b.x.isFinite, b.y.isFinite,
                   (0...1).contains(b.x), (0...1).contains(b.y), (0...3).contains(b.rotation),
+                  (40...5000).contains(b.repeatIntervalMs), (version >= 2 || b.action == .tap),
+                  (version >= 3 || (b.action != .fpsView && b.action != .skillAim)),
+                  (b.action != .script || (version >= 4 && UUID(uuidString: b.scriptID) != nil)),
+                  (b.cancelKey == nil || (version >= 5 && b.action == .skillAim && MappingKey.isValidCancel(b.cancelKey ?? "") && b.cancelKey != b.key)),
+                  b.sensitivity.isFinite, (0.1...5).contains(b.sensitivity),
+                  b.aimRadius.isFinite, (0.05...0.45).contains(b.aimRadius),
+                  b.endX.isFinite, b.endY.isFinite, (0...1).contains(b.endX), (0...1).contains(b.endY), (40...10000).contains(b.durationMs),
                   seen.insert("\(b.rotation):\(b.key)").inserted else { return false }
+            if b.action == .gesture {
+                guard (2...1024).contains(b.trace.count), b.trace.first?.tMs == 0,
+                      b.trace.first?.x == b.x, b.trace.first?.y == b.y,
+                      let last = b.trace.last, (1...10000).contains(last.tMs),
+                      b.trace.allSatisfy({ $0.x.isFinite && $0.y.isFinite && (0...1).contains($0.x) && (0...1).contains($0.y) && (0...10000).contains($0.tMs) }),
+                      zip(b.trace, b.trace.dropFirst()).allSatisfy({ pair in pair.0.tMs <= pair.1.tMs }) else { return false }
+            } else if !b.trace.isEmpty { return false }
             bindingCounts[b.rotation, default: 0] += 1
             guard bindingCounts[b.rotation, default: 0] <= 64 else { return false }
         }
@@ -252,12 +436,16 @@ struct MappingScheme: Codable, Equatable {
 }
 
 final class KeyMappingStore: ObservableObject {
+    private struct AppAssociations: Codable {
+        var enabled = false
+        var profiles: [String: String] = [:]
+    }
     static let defaultMarkerOpacity: Double = 0.85
     private static let markerOpacityKey = "miko.keymap.markerOpacity"
 
     @Published private(set) var scheme = MappingScheme() { didSet { onChange?() } }
     @Published private(set) var draft = MappingScheme() { didSet { onChange?() } }
-    @Published private(set) var editing = false { didSet { onChange?() } }
+    @Published private(set) var editing = false { didSet { if !editing { traceTarget = nil }; onChange?() } }
     @Published var enabled = false { didSet { onChange?() } }
     @Published var hints = true { didSet { onChange?() } }
     @Published var markerOpacity: Double {
@@ -276,8 +464,15 @@ final class KeyMappingStore: ObservableObject {
     @Published private(set) var selectedKey: String? { didSet { onChange?() } }
     @Published private(set) var selectedJoystickIndex: Int? { didSet { onChange?() } }
     @Published private(set) var currentRotation = 0
+    @Published private(set) var traceTarget: MappingTraceTarget?
     @Published private(set) var profiles: [String] = []
     @Published private(set) var activeProfileName: String?
+    @Published private(set) var foregroundPackage: String?
+    @Published private(set) var autoSwitchEnabled = false
+    @Published private(set) var associatedProfile: String?
+    @Published private(set) var associationError: String?
+    private var associations = AppAssociations()
+    private var manuallyOverriddenPackage: String?
     @Published private(set) var failure: KeyMappingFailure?
     var error: String? { failure?.englishMessage }
     var currentFileURL: URL? { location }
@@ -301,6 +496,7 @@ final class KeyMappingStore: ObservableObject {
     func load(path: String) {
         let base = URL(fileURLWithPath: path)
         baseLocation = base
+        loadAssociations()
         refreshProfiles()
         if let stored = readActiveProfileName(),
            let profileURL = profileURL(for: stored),
@@ -312,7 +508,7 @@ final class KeyMappingStore: ObservableObject {
             loadFile(at: base)
         }
     }
-    func selectProfile(_ name: String?) -> Bool {
+    func selectProfile(_ name: String?, automatic: Bool = false) -> Bool {
         guard !hasUnsavedChanges, let baseLocation else { return false }
         let wasEditing = editing
         let targetURL: URL
@@ -324,6 +520,7 @@ final class KeyMappingStore: ObservableObject {
             targetURL = baseLocation
         }
         persistActiveProfileName(name)
+        if !automatic { manuallyOverriddenPackage = foregroundPackage }
         activeProfileName = name
         loadFile(at: targetURL)
         if wasEditing {
@@ -339,6 +536,75 @@ final class KeyMappingStore: ObservableObject {
         }
         return true
     }
+
+    private var associationsURL: URL? {
+        baseLocation?.deletingPathExtension().appendingPathExtension("applications.json")
+    }
+
+    private func loadAssociations() {
+        associations = AppAssociations(); associationError = nil
+        guard let url = associationsURL, FileManager.default.fileExists(atPath: url.path) else {
+            autoSwitchEnabled = false; return
+        }
+        do {
+            associations = try JSONDecoder().decode(AppAssociations.self, from: Data(contentsOf: url))
+            autoSwitchEnabled = associations.enabled
+        } catch {
+            autoSwitchEnabled = false
+            associationError = "Could not read application associations: \(error.localizedDescription)"
+        }
+    }
+
+    private func saveAssociations(_ value: AppAssociations) -> Bool {
+        guard associationError == nil, let url = associationsURL else { return false }
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try JSONEncoder().encode(value).write(to: url, options: .atomic)
+            associations = value; autoSwitchEnabled = value.enabled
+            return true
+        } catch {
+            associationError = "Could not save application associations: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func setAutoSwitch(_ enabled: Bool) -> Bool {
+        var next = associations; next.enabled = enabled
+        if enabled { manuallyOverriddenPackage = nil }
+        return saveAssociations(next)
+    }
+
+    func associateForegroundWithCurrentProfile() -> Bool {
+        guard let package = foregroundPackage else { return false }
+        var next = associations
+        next.profiles[package] = activeProfileName ?? ""
+        guard saveAssociations(next) else { return false }
+        associatedProfile = activeProfileName ?? ""
+        manuallyOverriddenPackage = nil
+        return true
+    }
+
+    func removeForegroundAssociation() -> Bool {
+        guard let package = foregroundPackage else { return false }
+        var next = associations; next.profiles.removeValue(forKey: package)
+        guard saveAssociations(next) else { return false }
+        associatedProfile = nil
+        return true
+    }
+
+    func updateForeground(_ package: String, beforeSwitch: () -> Void) {
+        if foregroundPackage != package {
+            foregroundPackage = package; manuallyOverriddenPackage = nil
+        }
+        associatedProfile = associations.profiles[package]
+        guard autoSwitchEnabled, associationError == nil, !editing,
+              manuallyOverriddenPackage != package, let profile = associations.profiles[package] else { return }
+        let target: String? = profile.isEmpty ? nil : profile
+        guard target != activeProfileName else { return }
+        if let target, !profiles.contains(target) { return }
+        beforeSwitch()
+        _ = selectProfile(target, automatic: true)
+    }
     func createProfile(named rawName: String, duplicateCurrent: Bool) -> Bool {
         guard !hasUnsavedChanges, let name = Self.sanitizedProfileName(rawName),
               let url = profileURL(for: name),
@@ -346,6 +612,7 @@ final class KeyMappingStore: ObservableObject {
         let wasEditing = editing
         let content = duplicateCurrent ? (wasEditing ? draft : scheme) : MappingScheme()
         guard (try? writeScheme(content, to: url)) != nil else { return false }
+        manuallyOverriddenPackage = foregroundPackage
         persistActiveProfileName(name)
         activeProfileName = name
         refreshProfiles()
@@ -365,6 +632,7 @@ final class KeyMappingStore: ObservableObject {
               let url = profileURL(for: name),
               !FileManager.default.fileExists(atPath: url.path) else { return false }
         guard let bytes = try? writeScheme(draft, to: url) else { return false }
+        manuallyOverriddenPackage = foregroundPackage
         persistActiveProfileName(name)
         activeProfileName = name
         location = url
@@ -398,6 +666,11 @@ final class KeyMappingStore: ObservableObject {
             location = dst
             persistActiveProfileName(newName)
         }
+        if associations.profiles.values.contains(oldName) {
+            var next = associations
+            for (package, profile) in associations.profiles where profile == oldName { next.profiles[package] = newName }
+            _ = saveAssociations(next)
+        }
         refreshProfiles()
         return true
     }
@@ -409,6 +682,11 @@ final class KeyMappingStore: ObservableObject {
             try FileManager.default.removeItem(at: url)
         } catch {
             return false
+        }
+        if associations.profiles.values.contains(name) {
+            var next = associations
+            next.profiles = next.profiles.filter { $0.value != name }
+            _ = saveAssociations(next)
         }
         refreshProfiles()
         if activeProfileName == name {
@@ -487,6 +765,7 @@ final class KeyMappingStore: ObservableObject {
     }
     func select(key: String, rotation: Int) -> Bool {
         guard editing, draft.bindings.contains(where: { $0.key == key && $0.rotation == rotation }) else { return false }
+        traceTarget = nil
         pendingPoint = nil
         selectedJoystickIndex = nil
         currentRotation = rotation
@@ -495,6 +774,7 @@ final class KeyMappingStore: ObservableObject {
     }
     func selectJoystick(at index: Int) -> Bool {
         guard editing, draft.joysticks.indices.contains(index) else { return false }
+        traceTarget = nil
         pendingPoint = nil
         selectedKey = nil
         currentRotation = draft.joysticks[index].rotation
@@ -503,6 +783,7 @@ final class KeyMappingStore: ObservableObject {
     }
     func clearSelection() {
         guard editing else { return }
+        traceTarget = nil
         pendingPoint = nil
         selectedKey = nil
         selectedJoystickIndex = nil
@@ -511,6 +792,13 @@ final class KeyMappingStore: ObservableObject {
         guard editing, Self.isValidPoint(x: x, y: y, rotation: rotation),
               let index = draft.bindings.firstIndex(where: { $0.key == key && $0.rotation == rotation }) else { return false }
         var copy = draft
+        if copy.bindings[index].action == .gesture {
+            let dx = x - copy.bindings[index].x, dy = y - copy.bindings[index].y
+            copy.bindings[index].trace = copy.bindings[index].trace.map { MappingTracePoint(x: $0.x + dx, y: $0.y + dy, tMs: $0.tMs) }
+            if !copy.bindings[index].trace.isEmpty {
+                copy.bindings[index].trace[0].x = x; copy.bindings[index].trace[0].y = y
+            }
+        }
         copy.bindings[index].x = x
         copy.bindings[index].y = y
         guard copy.validate() else { return false }
@@ -556,6 +844,86 @@ final class KeyMappingStore: ObservableObject {
         draft = copy
         return true
     }
+    func setAction(key: String, rotation: Int, action: MappingAction, repeatIntervalMs: Int) -> Bool {
+        guard editing, let index = draft.bindings.firstIndex(where: { $0.key == key && $0.rotation == rotation }) else { return false }
+        traceTarget = nil
+        var copy = draft
+        copy.bindings[index].action = action
+        if action != .skillAim { copy.bindings[index].cancelKey = nil }
+        if action != .script { copy.bindings[index].scriptID = "" }
+        copy.bindings[index].repeatIntervalMs = action == .tap ? 120 : repeatIntervalMs
+        if action != .swipe && action != .skillAim {
+            copy.bindings[index].endX = 0.5; copy.bindings[index].endY = 0.5
+            copy.bindings[index].durationMs = 300
+        }
+        if action == .gesture {
+            if copy.bindings[index].trace.isEmpty {
+                let point = MappingTracePoint(x: copy.bindings[index].x, y: copy.bindings[index].y, tMs: 0)
+                copy.bindings[index].trace = [point, MappingTracePoint(x: point.x, y: point.y, tMs: 300)]
+            }
+        } else {
+            copy.bindings[index].trace = []
+        }
+        if action == .fpsView || action == .skillAim { copy.version = max(copy.version, 3) }
+        else if action == .script { copy.version = max(copy.version, 4) }
+        else if action != .tap { copy.version = max(copy.version, 2) }
+        guard copy.validate() else { return false }
+        draft = copy
+        return true
+    }
+    func setScriptAction(key: String, rotation: Int, scriptID: String) -> Bool {
+        guard editing, UUID(uuidString: scriptID) != nil,
+              let index = draft.bindings.firstIndex(where: { $0.key == key && $0.rotation == rotation }) else { return false }
+        var copy = draft
+        copy.version = max(copy.version, 4); copy.bindings[index].action = .script; copy.bindings[index].scriptID = scriptID
+        copy.bindings[index].cancelKey = nil
+        copy.bindings[index].trace = []
+        guard copy.validate() else { return false }
+        draft = copy; return true
+    }
+    func setAim(key: String, rotation: Int, sensitivity: Double, radius: Double, cancelX: Double, cancelY: Double) -> Bool {
+        guard editing, let index = draft.bindings.firstIndex(where: { $0.key == key && $0.rotation == rotation }),
+              draft.bindings[index].action == .fpsView || draft.bindings[index].action == .skillAim else { return false }
+        var copy = draft
+        copy.bindings[index].sensitivity = sensitivity; copy.bindings[index].aimRadius = radius
+        copy.bindings[index].endX = cancelX; copy.bindings[index].endY = cancelY
+        guard copy.validate() else { return false }
+        draft = copy; return true
+    }
+    func setSkillCancelKey(key: String, rotation: Int, cancelKey: String?) -> Bool {
+        guard editing, let index = draft.bindings.firstIndex(where: { $0.key == key && $0.rotation == rotation }),
+              draft.bindings[index].action == .skillAim else { return false }
+        var copy = draft
+        copy.bindings[index].cancelKey = cancelKey
+        if cancelKey != nil { copy.version = max(copy.version, 5) }
+        guard copy.validate() else { return false }
+        draft = copy
+        return true
+    }
+    func setSwipe(key: String, rotation: Int, endX: Double, endY: Double, durationMs: Int) -> Bool {
+        guard editing, let index = draft.bindings.firstIndex(where: { $0.key == key && $0.rotation == rotation }), draft.bindings[index].action == .swipe else { return false }
+        var copy = draft
+        copy.bindings[index].endX = endX; copy.bindings[index].endY = endY
+        copy.bindings[index].durationMs = durationMs
+        guard copy.validate() else { return false }
+        draft = copy
+        return true
+    }
+    func setTrace(key: String, rotation: Int, points: [MappingTracePoint]) -> Bool {
+        guard editing, let index = draft.bindings.firstIndex(where: { $0.key == key && $0.rotation == rotation }), draft.bindings[index].action == .gesture, let first = points.first else { return false }
+        var copy = draft
+        copy.bindings[index].x = first.x; copy.bindings[index].y = first.y
+        copy.bindings[index].trace = points
+        guard copy.validate() else { return false }
+        draft = copy
+        return true
+    }
+    func beginTrace(key: String, rotation: Int) -> Bool {
+        guard editing, draft.bindings.contains(where: { $0.key == key && $0.rotation == rotation && $0.action == .gesture }) else { return false }
+        traceTarget = MappingTraceTarget(key: key, rotation: rotation)
+        return true
+    }
+    func cancelTrace() { traceTarget = nil }
     func addJoystick(x: Double, y: Double, rotation: Int, preset: JoystickPreset = .wasd) -> Bool {
         guard editing, Self.isValidPoint(x: x, y: y, rotation: rotation) else { return false }
         var copy = draft
@@ -606,7 +974,9 @@ final class KeyMappingStore: ObservableObject {
         if let existingKey = selectedKey,
            let existing = copy.bindings.first(where: { $0.key == existingKey && $0.rotation == currentRotation }) {
             copy.bindings.removeAll { ($0.key == existingKey || $0.key == key) && $0.rotation == existing.rotation }
-            copy.bindings.append(MappingBinding(key: key, x: existing.x, y: existing.y, rotation: existing.rotation))
+            var rebound = existing
+            rebound.key = key
+            copy.bindings.append(rebound)
             guard copy.validate() else { return false }
             draft = copy; selectedKey = key; return true
         }
@@ -633,6 +1003,7 @@ final class KeyMappingStore: ObservableObject {
         draft.bindings.contains { $0.rotation == rotation } || draft.joysticks.contains { $0.rotation == rotation }
     }
     func rotationChanged(to next: Int? = nil) {
+        traceTarget = nil
         if let next, (0...3).contains(next) { currentRotation = next }
         pendingPoint = nil
         selectedKey = nil

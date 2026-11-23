@@ -1,7 +1,7 @@
 //! A single input owner. Cancellation leaves enough state to release every
 //! potentially delivered down event, including temporary clipboard chords.
 use super::{Command, panel_point};
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use miko_proto::{Controller, control as pb};
 use serde_json::json;
 use std::future::Future;
@@ -136,6 +136,9 @@ pub(crate) struct InputState<W> {
 }
 
 impl<W: InputWire> InputState<W> {
+    pub(crate) fn has_held_inputs(&self) -> bool {
+        !self.held.is_empty()
+    }
     pub(crate) fn new(wire: W) -> Self {
         Self {
             wire,
@@ -191,7 +194,7 @@ impl<W: InputWire> InputState<W> {
                 )
                 .await
             {
-                self.release_matching(true).await;
+                let _ = self.release_matching(true).await;
                 return Err(error);
             }
         }
@@ -200,18 +203,23 @@ impl<W: InputWire> InputState<W> {
 
     /// Also runs after a cancelled RPC: the remote may have applied a down
     /// even when its response never arrived. Releases use bounded attempts.
-    pub(crate) async fn release(&mut self) {
+    pub(crate) async fn release(&mut self) -> Result<()> {
         self.wire.close_clipboard();
-        self.release_matching(false).await;
+        self.release_matching(false).await
     }
 
-    async fn release_matching(&mut self, evdev_only: bool) {
+    async fn release_matching(&mut self, evdev_only: bool) -> Result<()> {
         // Keep entries owned until each attempt finishes: shutdown may also
         // interrupt a chord's error recovery while an up is awaiting a reply.
-        while let Some(index) = self.held.iter().rposition(|h|
-            !evdev_only || matches!(h, Held::Key { code_type, .. } if *code_type == pb::keyboard_event::KeyCodeType::Evdev as i32)) {
+        let mut first_error = None;
+        for index in (0..self.held.len()).rev() {
+            if evdev_only
+                && !matches!(self.held[index], Held::Key { code_type, .. } if code_type == pb::keyboard_event::KeyCodeType::Evdev as i32)
+            {
+                continue;
+            }
             let entry = self.held[index].clone();
-            let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            let result = tokio::time::timeout(Duration::from_secs(1), async {
                 match entry {
                     Held::Touch { id, x, y } => self.wire.touch(touch_event(id, x, y, false)).await,
                     Held::Key {
@@ -221,8 +229,23 @@ impl<W: InputWire> InputState<W> {
                     } => self.wire.key(key_event(code_type, code, key, false)).await,
                 }
             })
-            .await;
-            self.held.remove(index);
+            .await
+            .map_err(|_| anyhow!("input release timed out"))
+            .and_then(|result| result);
+            match result {
+                Ok(()) => {
+                    self.held.remove(index);
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 

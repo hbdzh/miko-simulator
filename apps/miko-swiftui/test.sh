@@ -13,6 +13,15 @@ swiftc -module-cache-path "$out/module-cache" \
   apps/miko-swiftui/Tests/DeviceBudget/main.swift -o "$out/device-budget-tests"
 "$out/device-budget-tests"
 swiftc -module-cache-path "$out/module-cache" \
+  apps/miko-swiftui/Center/BatchDeviceOperations.swift \
+  apps/miko-swiftui/Tests/Batch/main.swift -o "$out/batch-device-tests"
+"$out/batch-device-tests"
+swiftc -module-cache-path "$out/module-cache" \
+  apps/miko-swiftui/Center/DeviceGroups.swift \
+  apps/miko-swiftui/Sources/DeviceWindowLayout.swift \
+  apps/miko-swiftui/Tests/DeviceGroups/main.swift -o "$out/device-groups-tests"
+"$out/device-groups-tests"
+swiftc -module-cache-path "$out/module-cache" \
   apps/miko-swiftui/Sources/FrameDecoder.swift \
   apps/miko-swiftui/Tests/main.swift -o "$out/frame-decoder-tests"
 "$out/frame-decoder-tests"

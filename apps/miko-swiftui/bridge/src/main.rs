@@ -24,9 +24,14 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Command {
+    InputReset,
+    MappingHold {
+        id: u16,
+        active: bool,
+    },
     Touch {
         x: f64,
         y: f64,
@@ -94,6 +99,41 @@ enum Command {
     ScriptRename {
         id: String,
         name: String,
+    },
+    ScriptActionsGet {
+        id: String,
+    },
+    ScriptActionDelete {
+        id: String,
+        revision: String,
+        index: usize,
+    },
+    ScriptActionWait {
+        id: String,
+        revision: String,
+        index: usize,
+        wait_ms: u64,
+    },
+    ScriptActionMove {
+        id: String,
+        revision: String,
+        from: usize,
+        to: usize,
+    },
+    ScriptActionGesture {
+        id: String,
+        revision: String,
+        index: usize,
+        x: f64,
+        y: f64,
+        end_x: f64,
+        end_y: f64,
+        duration_ms: u64,
+    },
+    ScriptActionCall {
+        id: String,
+        revision: String,
+        script: String,
     },
     ScriptImport {
         path: String,
@@ -303,6 +343,42 @@ async fn watch_display_orientation(adb: std::path::PathBuf, serial: String, valu
     }
 }
 
+fn foreground_package(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .filter(|line| line.contains("mResumedActivity") || line.contains("topResumedActivity"))
+        .flat_map(str::split_whitespace)
+        .find_map(|word| {
+            let package = word
+                .split_once('/')?
+                .0
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '_');
+            (package.contains('.')
+                && package.split('.').all(|part| {
+                    !part.is_empty() && part.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                }))
+            .then_some(package)
+        })
+}
+
+async fn watch_foreground_app(adb: std::path::PathBuf, serial: String) {
+    loop {
+        let mut command = tokio::process::Command::new(&adb);
+        command
+            .args(["-s", &serial, "shell", "dumpsys", "activity", "activities"])
+            .kill_on_drop(true);
+        if let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(3), command.output()).await
+            && output.status.success()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some(package) = foreground_package(&text) {
+                eprintln!("MIKO_FOREGROUND:{}", json!({"package":package}));
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
 fn oriented_packet(
     width: u32,
     height: u32,
@@ -438,7 +514,13 @@ fn fixture_reply(line: &str) -> Option<(&'static str, serde_json::Value)> {
     let mut value =
         json!({"ok":false,"code":PREVIEW_UNSUPPORTED.code,"message":PREVIEW_UNSUPPORTED.message});
     let prefix = match serde_json::from_str::<Command>(line) {
-        Ok(Command::SyncMode { .. } | Command::SyncInput { .. } | Command::SyncRelease) => {
+        Ok(
+            Command::InputReset
+            | Command::MappingHold { .. }
+            | Command::SyncMode { .. }
+            | Command::SyncInput { .. }
+            | Command::SyncRelease,
+        ) => {
             return None;
         }
         Ok(
@@ -450,6 +532,12 @@ fn fixture_reply(line: &str) -> Option<(&'static str, serde_json::Value)> {
             | Command::ScriptList
             | Command::ScriptDelete { .. }
             | Command::ScriptRename { .. }
+            | Command::ScriptActionsGet { .. }
+            | Command::ScriptActionDelete { .. }
+            | Command::ScriptActionWait { .. }
+            | Command::ScriptActionMove { .. }
+            | Command::ScriptActionGesture { .. }
+            | Command::ScriptActionCall { .. }
             | Command::ScriptImport { .. }
             | Command::ScriptExport { .. }
             | Command::ScriptPlayStart { .. }
@@ -536,10 +624,98 @@ struct BridgeInputs {
     physical_rotation: Arc<AtomicU32>,
     scripts: script::ScriptManager,
     sync: sync::BridgeSync,
+    follower_input: sync::FollowerInputArbiter,
+    rejected_remote: sync::RejectedRemote,
+    input_faulted: bool,
+    input_lease: Option<String>,
+    lease_release_failed: bool,
+    mapping_holds: std::collections::HashSet<u16>,
 }
 
-impl SerialInput for BridgeInputs {
-    async fn handle(&mut self, line: String) {
+fn blocked_by_input_fault(command: &Command) -> bool {
+    script::is_direct_input(command)
+        || matches!(
+            command,
+            Command::SyncInput { .. }
+                | Command::ToolKey { .. }
+                | Command::Rotate { .. }
+                | Command::ScriptPlayStart { .. }
+                | Command::ScriptRecordStart
+                | Command::MappingHold { active: true, .. }
+        )
+}
+
+impl BridgeInputs {
+    async fn acquire_input(&mut self, takeover: bool) -> Result<()> {
+        if self.input_lease.is_none() {
+            let result = self
+                .client
+                .call(
+                    "input.acquire",
+                    json!({"device":self.device,"takeover":takeover}),
+                )
+                .await?;
+            let token = result["token"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("invalid input ownership reply"))?;
+            self.input_lease = Some(token.to_owned());
+        }
+        Ok(())
+    }
+
+    async fn release_idle_lease(&mut self) {
+        if self.lease_release_failed
+            || self.state.has_held_inputs()
+            || self.scripts.is_playing()
+            || !self.mapping_holds.is_empty()
+        {
+            return;
+        }
+        if let Some(token) = self.input_lease.as_ref() {
+            match self
+                .client
+                .call("input.release", json!({"device":self.device,"token":token}))
+                .await
+            {
+                Ok(_) => self.input_lease = None,
+                Err(error) => {
+                    self.input_faulted = true;
+                    self.lease_release_failed = true;
+                    eprintln!(
+                        "MIKO_INPUT:{}",
+                        json!({"state":"failed","message":format!("Input ownership release failed: {error}")})
+                    );
+                }
+            }
+        }
+    }
+
+    async fn input_failure(&mut self, message: String) {
+        self.input_faulted = true;
+        self.scripts.fail_recording(&message);
+        let _ = self.state.release().await;
+        self.follower_input = sync::FollowerInputArbiter::default();
+        self.sync.emit_leader_release();
+        eprintln!(
+            "MIKO_INPUT:{}",
+            json!({"state":"failed", "message":message})
+        );
+    }
+
+    async fn release_before_handoff(&mut self) -> bool {
+        match self.state.release().await {
+            Ok(()) => true,
+            Err(error) => {
+                self.input_failure(format!("Input release failed: {error:#}"))
+                    .await;
+                false
+            }
+        }
+    }
+}
+
+impl BridgeInputs {
+    async fn handle_line(&mut self, line: String) {
         let command = match serde_json::from_str::<Command>(&line) {
             Ok(command) => command,
             Err(error) => {
@@ -547,7 +723,53 @@ impl SerialInput for BridgeInputs {
                 return;
             }
         };
+        if self.input_faulted && blocked_by_input_fault(&command) {
+            if let Command::SyncInput { event, .. } = &command
+                && !self.rejected_remote.should_skip(event)
+            {
+                self.rejected_remote.reject(event);
+            }
+            return;
+        }
+        // A locked follower must not acquire or revoke another client's input
+        // for a command that will not be delivered to the device.
+        if self.sync.ignores_user_input(&command) {
+            return;
+        }
+        let needs_input = script::is_direct_input(&command)
+            || matches!(
+                command,
+                Command::ToolKey { .. }
+                    | Command::ScriptPlayStart { .. }
+                    | Command::MappingHold { active: true, .. }
+            );
+        let takeover = script::is_manual_takeover(&command)
+            || matches!(command, Command::MappingHold { active: true, .. });
+        if needs_input && let Err(error) = self.acquire_input(takeover).await {
+            self.input_faulted = true;
+            eprintln!(
+                "MIKO_INPUT:{}",
+                json!({"state":"failed","message":format!("Device input is busy: {error}")})
+            );
+            return;
+        }
         match command {
+            Command::MappingHold { id, active } => {
+                if active {
+                    self.mapping_holds.insert(id);
+                } else {
+                    self.mapping_holds.remove(&id);
+                }
+                return;
+            }
+            Command::InputReset => {
+                match self.state.release().await {
+                    Ok(()) if !self.lease_release_failed => self.input_faulted = false,
+                    Ok(()) => {}
+                    Err(error) => eprintln!("Input reset could not release held inputs: {error:#}"),
+                }
+                return;
+            }
             Command::SyncMode {
                 role,
                 lock,
@@ -576,30 +798,56 @@ impl SerialInput for BridgeInputs {
                     sync_text,
                     sync_tool_keys,
                 ) {
-                    self.state.release().await;
+                    self.rejected_remote.clear();
+                    if !self.release_before_handoff().await {
+                        return;
+                    }
+                    self.follower_input = sync::FollowerInputArbiter::default();
                 }
                 return;
             }
             Command::SyncInput { seq, event } => {
                 let rotation = self.rotation.load(Ordering::Relaxed);
-                if let Some(adapted) = self.sync.accept_follower_input(seq, &event, rotation)
-                    && let Err(error) = script::execute_event(
+                if let Some(adapted) = self.sync.accept_follower_input(seq, &event, rotation) {
+                    if self.rejected_remote.should_skip(&adapted) {
+                        return;
+                    }
+                    if self.sync.is_unlocked_follower() && !self.follower_input.remote(&adapted) {
+                        return;
+                    }
+                    if let Err(error) = self.acquire_input(false).await {
+                        self.rejected_remote.reject(&adapted);
+                        self.follower_input = sync::FollowerInputArbiter::default();
+                        self.input_faulted = true;
+                        eprintln!(
+                            "MIKO_INPUT:{}",
+                            json!({"state":"failed","message":format!("Device input is busy: {error}")})
+                        );
+                        return;
+                    }
+                    if let Err(error) = script::execute_event(
                         &mut self.state,
                         &self.client,
                         &self.device,
                         self.panel,
                         &self.rotation,
                         &adapted,
+                        self.input_lease.as_deref(),
                     )
                     .await
-                {
-                    eprintln!("Sync input failed: {error:#}");
+                    {
+                        self.input_failure(format!("Sync input failed: {error:#}"))
+                            .await;
+                    }
                 }
                 return;
             }
             Command::SyncRelease => {
-                if self.sync.is_active() {
-                    self.state.release().await;
+                self.rejected_remote.clear();
+                if self.sync.is_active()
+                    && (!self.sync.is_unlocked_follower() || self.follower_input.remote_release())
+                {
+                    let _ = self.release_before_handoff().await;
                 }
                 return;
             }
@@ -632,14 +880,38 @@ impl SerialInput for BridgeInputs {
             }
             let outcome = self.scripts.handle_command(&command, Instant::now());
             if outcome.release {
-                self.state.release().await;
+                if !self.release_before_handoff().await {
+                    self.scripts.complete_tick(Some("Input release failed"));
+                    return;
+                }
                 self.sync.emit_leader_release();
             }
             return;
         }
-        // While a script plays back or this bridge is a locked sync follower,
-        // direct user input is ignored.
-        if self.scripts.ignores_user_input(&command) || self.sync.ignores_user_input(&command) {
+        if self.sync.is_unlocked_follower()
+            && (script::is_direct_input(&command)
+                || matches!(command, Command::ToolKey { .. } | Command::Rotate { .. }))
+        {
+            let decision = self.follower_input.local(&command);
+            if !decision.accept {
+                return;
+            }
+            if decision.release_remote && !self.release_before_handoff().await {
+                return;
+            }
+        }
+        if self.scripts.take_manual_control(&command) {
+            if !self.release_before_handoff().await {
+                return;
+            }
+            self.sync.emit_leader_release();
+        } else if self.scripts.is_playing()
+            && matches!(
+                command,
+                Command::Touch { .. } | Command::MappedTouch { .. } | Command::Key { .. }
+            )
+        {
+            // A release from before playback must not release a script input.
             return;
         }
         match command {
@@ -674,14 +946,15 @@ impl SerialInput for BridgeInputs {
                 ]
                 .contains(&key.as_str())
                 {
-                    self.scripts.record_tool_key(&key, Instant::now());
-                    self.sync.emit_leader_tool_key(&key);
                     if let Err(e) = self
                         .client
-                        .call("key.press", json!({"device":self.device, "key":key}))
+                        .call("key.press", json!({"device":self.device, "key":key, "input_lease":self.input_lease}))
                         .await
                     {
-                        eprintln!("Key failed: {e}");
+                        self.input_failure(format!("Key input failed: {e}")).await;
+                    } else {
+                        self.scripts.record_tool_key(&key, Instant::now());
+                        self.sync.emit_leader_tool_key(&key);
                     }
                 }
             }
@@ -795,28 +1068,44 @@ impl SerialInput for BridgeInputs {
                 });
             }
             command => {
-                self.scripts.record_user_command(&command, Instant::now());
-                self.sync.emit_leader_command(&command);
+                let recorded = command.clone();
                 if let Err(e) = self
                     .state
                     .command(command, self.panel, &self.rotation)
                     .await
                 {
-                    eprintln!("Input failed: {e:#}");
+                    self.input_failure(format!("Input failed: {e:#}")).await;
+                } else {
+                    self.scripts.record_user_command(&recorded, Instant::now());
+                    self.sync.emit_leader_command(&recorded);
                 }
             }
         }
     }
+}
+
+impl SerialInput for BridgeInputs {
+    async fn handle(&mut self, line: String) {
+        self.handle_line(line).await;
+        self.release_idle_lease().await;
+    }
     async fn release(&mut self) {
-        self.state.release().await;
+        if let Err(error) = self.state.release().await {
+            eprintln!("Input release failed during shutdown: {error:#}");
+            return;
+        }
+        self.mapping_holds.clear();
+        self.scripts.complete_tick(Some("Player connection closed"));
+        self.release_idle_lease().await;
     }
     fn next_tick(&self) -> Option<Instant> {
         self.scripts.next_tick()
     }
     async fn tick(&mut self, now: Instant) {
         let outcome = self.scripts.tick(now);
-        for event in outcome.events {
-            self.sync.emit_leader_event(&event);
+        let mut failure = None;
+        for (offset, event) in outcome.events.into_iter().enumerate() {
+            self.scripts.executing_event(offset);
             if let Err(error) = script::execute_event(
                 &mut self.state,
                 &self.client,
@@ -824,18 +1113,31 @@ impl SerialInput for BridgeInputs {
                 self.panel,
                 &self.rotation,
                 &event,
+                self.input_lease.as_deref(),
             )
             .await
             {
                 eprintln!("Script playback event failed: {error:#}");
+                failure = Some(format!("Script playback input failed: {error:#}"));
+                break;
             }
+            self.sync.emit_leader_event(&event);
         }
         // Release after the last injected events, so a script that ends with a
         // press/release pair does not leave the device held.
-        if outcome.release {
-            self.state.release().await;
+        if outcome.release || failure.is_some() {
+            if let Err(error) = self.state.release().await {
+                failure = Some(format!("Input release failed: {error:#}"));
+                self.input_faulted = true;
+                eprintln!(
+                    "MIKO_INPUT:{}",
+                    json!({"state":"failed", "message":failure.as_deref()})
+                );
+            }
             self.sync.emit_leader_release();
         }
+        self.scripts.complete_tick(failure.as_deref());
+        self.release_idle_lease().await;
     }
 }
 
@@ -911,6 +1213,7 @@ async fn main() -> Result<()> {
     let paths = MikoPaths::discover()?;
     let client =
         Arc::new(miko_client::Client::connect(&paths.socket(), "miko-swiftui-bridge").await?);
+    let daemon_connection = Arc::clone(&client);
     let info: ConnectInfo = client
         .call_as("device.connect_info", json!({"device":args[1]}))
         .await?;
@@ -970,6 +1273,10 @@ async fn main() -> Result<()> {
         info.adb_serial.clone(),
         Arc::clone(&logical_rotation),
     ));
+    tokio::spawn(watch_foreground_app(
+        info.adb_path.clone(),
+        info.adb_serial.clone(),
+    ));
     // A cloned Controller shares its HTTP/2 connection. Use another actual
     // connection in FIFO mode so screenshot flow control cannot hold up small
     // input/clipboard responses, even with continuously changing frames.
@@ -1008,6 +1315,12 @@ async fn main() -> Result<()> {
             frame_height,
         ),
         sync: sync::BridgeSync::new(width, height),
+        follower_input: sync::FollowerInputArbiter::default(),
+        rejected_remote: sync::RejectedRemote::default(),
+        input_faulted: false,
+        input_lease: None,
+        lease_release_failed: false,
+        mapping_holds: std::collections::HashSet::new(),
     };
     let mut pump = FramePump {
         frames,
@@ -1027,6 +1340,10 @@ async fn main() -> Result<()> {
                 () = pump.run() => false,
                 () = &mut shutdown => false,
                 _ = &mut output_closed => false,
+                () = daemon_connection.wait_closed() => {
+                    eprintln!("Daemon connection closed; stopping player input");
+                    false
+                },
                 result = &mut worker => {
                     if let Err(error) = result { eprintln!("Input worker failed: {error}"); }
                     true
@@ -1069,7 +1386,14 @@ async fn main() -> Result<()> {
                         }
                     }
                 };
-                tokio::select! { () = serial => {}, () = &mut shutdown => {}, _ = &mut output_closed => {} }
+                tokio::select! {
+                    () = serial => {},
+                    () = &mut shutdown => {},
+                    _ = &mut output_closed => {},
+                    () = daemon_connection.wait_closed() => {
+                        eprintln!("Daemon connection closed; stopping player input");
+                    },
+                }
             }
             drop(pump);
             handler.release().await;
@@ -1080,6 +1404,22 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn foreground_activity_package_is_parsed_without_guessing_on_failure() {
+        assert_eq!(
+            super::foreground_package(
+                "mResumedActivity: ActivityRecord{42 u0 com.example.game/.Main t3}"
+            ),
+            Some("com.example.game")
+        );
+        assert_eq!(
+            super::foreground_package(
+                "topResumedActivity=ActivityRecord{42 u0 org.example.app/org.example.app.Start t9}"
+            ),
+            Some("org.example.app")
+        );
+        assert_eq!(super::foreground_package("mResumedActivity: null"), None);
+    }
     use super::*;
 
     #[test]
@@ -1257,6 +1597,31 @@ mod tests {
                 options: Some(_),
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn input_fault_blocks_new_input_until_reset() {
+        let down = Command::MappedTouch {
+            id: 3,
+            x: 0.5,
+            y: 0.5,
+            down: true,
+        };
+        let up = Command::MappedTouch {
+            id: 3,
+            x: 0.5,
+            y: 0.5,
+            down: false,
+        };
+        assert!(blocked_by_input_fault(&down));
+        assert!(blocked_by_input_fault(&up));
+        assert!(blocked_by_input_fault(&Command::ScriptRecordStart));
+        assert!(!blocked_by_input_fault(&Command::InputReset));
+        assert!(!blocked_by_input_fault(&Command::ScriptPlayStop));
+        assert!(matches!(
+            serde_json::from_str::<Command>(r#"{"type":"input_reset"}"#).unwrap(),
+            Command::InputReset
         ));
     }
 

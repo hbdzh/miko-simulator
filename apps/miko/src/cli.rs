@@ -188,6 +188,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: JobsCmd,
     },
+    /// Run and control conditional workflows.
+    Flow {
+        #[command(subcommand)]
+        cmd: FlowCmd,
+    },
     /// Serve MCP on stdio for AI agents (add to Claude: `claude mcp add miko -- miko mcp`).
     Mcp {
         /// Allow destructive commands (reset, delete…) on devices the agent didn't create (D5).
@@ -781,6 +786,24 @@ pub enum JobsCmd {
     Wait { job: String },
     /// Cancel a job.
     Cancel { job: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FlowCmd {
+    /// Run a workflow JSON file independently on each device.
+    Run {
+        file: PathBuf,
+        #[arg(long, required = true)]
+        device: Vec<String>,
+        #[arg(long)]
+        paused: bool,
+        #[arg(long)]
+        screenshots: bool,
+    },
+    /// Show the current workflow node.
+    Status { device: String },
+    /// Pause, resume, step, or stop a device's workflow.
+    Control { device: String, command: String },
 }
 
 #[cfg(test)]

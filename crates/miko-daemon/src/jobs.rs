@@ -122,7 +122,20 @@ impl JobManager {
                     j.result = Some(v);
                 }
                 Err(err) => {
-                    j.state = if miko_core::cancel::is_cancelled(&err) || e.cancel.is_cancelled() {
+                    let cleanup_failed = err
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("cleanup_failed"))
+                        .and_then(Value::as_bool)
+                        == Some(true);
+                    let exact_outcome = matches!(
+                        j.kind.as_str(),
+                        "device.stop_task" | "file.install_task" | "device.clone_task"
+                    );
+                    j.state = if !cleanup_failed
+                        && (miko_core::cancel::is_cancelled(&err)
+                            || (!exact_outcome && e.cancel.is_cancelled()))
+                    {
                         JobState::Cancelled
                     } else {
                         JobState::Failed
@@ -282,6 +295,23 @@ pub async fn run_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_failure_is_not_reported_as_cancelled() {
+        let jobs = JobManager::new();
+        let (id, cancel) = jobs.create("device.clone_task", None);
+        cancel.cancel();
+        let error = MikoError::sdk("cleanup failed").with_data(json!({"cleanup_failed":true}));
+        assert_eq!(jobs.finish(id, Err(error)).unwrap().state, JobState::Failed);
+        let (id, cancel) = jobs.create("file.install_task", None);
+        cancel.cancel();
+        assert_eq!(
+            jobs.finish(id, Err(MikoError::sdk("installation result unknown")))
+                .unwrap()
+                .state,
+            JobState::Failed
+        );
+    }
 
     #[test]
     fn filtered_lists_and_counts_preserve_mixed_job_order_and_results() {

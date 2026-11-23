@@ -187,10 +187,12 @@ impl State {
 
     pub(crate) fn connection_opened(&self, conn: u64) {
         lock(&self.leases).connected(conn);
+        lock(&self.input_ownership).connected(conn);
     }
 
     /// A client connection closed: its leases expire after the grace period.
     pub fn connection_closed(&self, conn: u64) {
+        lock(&self.input_ownership).disconnected(conn);
         // Keep the disconnection in memory even if storage is temporarily
         // unavailable; recovery treats an open connection as disconnected.
         let mut leases = lock(&self.leases);

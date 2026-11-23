@@ -7,6 +7,7 @@ struct DeviceBudget: Decodable, Equatable {
         let name: String
         let expected_mb: UInt64
         let measured_mb: UInt64?
+        let cpu_percent: UInt64?
         var countedMB: UInt64 { max(expected_mb, measured_mb ?? 0) }
     }
     let total_mb: UInt64

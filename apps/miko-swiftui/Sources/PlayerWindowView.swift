@@ -191,12 +191,9 @@ struct ContentView: View {
                                     recording: transport.recording != .idle,
                                     recordingUnknown: transport.recordingStateUnknown)
     }
-    /// Ordinary player input is ignored by the bridge during playback, so the
-    /// sidebar disables those entries until the script stops.
     private var inputEnabled: Bool {
         linkState.isRunning
             && !transport.stoppingDevice
-            && transport.scriptPlayback == .idle
             && !(transport.syncRole == .follower && transport.syncFollowerLocked)
     }
 
@@ -945,6 +942,7 @@ private enum KeyMappingActions {
             transport.onStatus?(t("请先保存或取消当前键位修改", "Save or cancel your current changes first", language))
             return
         }
+        transport.onReleasePlayerInput?()
         _ = mapping.selectProfile(name)
     }
 
@@ -1305,6 +1303,7 @@ private struct KeyMappingSidePanel: View {
                 VStack(alignment: .leading, spacing: 20) {
                     addSection
                     unifiedListSection
+                    selectedBindingSection
                     schemeSection
                 }
                 .padding(.horizontal, 14)
@@ -1316,6 +1315,7 @@ private struct KeyMappingSidePanel: View {
             footer
         }
         .frame(width: mappingConfigPanelWidth)
+        .onAppear { transport.scriptList() }
         .background {
             if overlay {
                 PlayerChromeMaterial(blendingMode: .withinWindow).allowsHitTesting(false)
@@ -1352,6 +1352,95 @@ private struct KeyMappingSidePanel: View {
             HStack(spacing: 10) {
                 toolButton(mode: .tap, icon: "hand.point.up.left", title: t("单点按键", "Tap Key", language))
                 toolButton(mode: .joystick, icon: "dpad", title: t("方向摇杆", "Joystick", language))
+            }
+        }
+    }
+
+    @ViewBuilder private var selectedBindingSection: some View {
+        if let key = mapping.selectedKey,
+           let binding = mapping.draft.bindings.first(where: { $0.key == key && $0.rotation == rotation }) {
+            VStack(alignment: .leading, spacing: 10) {
+                sectionLabel(t("按键行为", "Key behavior", language))
+                inspectorGroup {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Picker(t("模式", "Mode", language), selection: Binding(
+                            get: { binding.action },
+                            set: { action in
+                                if action == .script, let script = transport.scripts.first { _ = mapping.setScriptAction(key: key, rotation: rotation, scriptID: script.id) }
+                                else { _ = mapping.setAction(key: key, rotation: rotation, action: action, repeatIntervalMs: binding.repeatIntervalMs) }
+                            }
+                        )) {
+                            Text(t("按住触碰", "Hold touch", language)).tag(MappingAction.tap)
+                            Text(t("切换长按", "Toggle hold", language)).tag(MappingAction.holdToggle)
+                            Text(t("按住连点", "Hold to repeat", language)).tag(MappingAction.repeatHold)
+                            Text(t("切换连点", "Toggle repeat", language)).tag(MappingAction.repeatToggle)
+                            Text(t("滑动", "Swipe", language)).tag(MappingAction.swipe)
+                            Text(t("录制手势", "Recorded gesture", language)).tag(MappingAction.gesture)
+                            Text(t("射击视角", "FPS view", language)).tag(MappingAction.fpsView)
+                            Text(t("技能瞄准", "Skill aim", language)).tag(MappingAction.skillAim)
+                            Text(t("运行脚本", "Run script", language)).tag(MappingAction.script).disabled(transport.scripts.isEmpty)
+                        }
+                        if binding.action == .script {
+                            Picker(t("脚本", "Script", language), selection: Binding(
+                                get: { binding.scriptID },
+                                set: { _ = mapping.setScriptAction(key: key, rotation: rotation, scriptID: $0) }
+                            )) {
+                                ForEach(transport.scripts) { script in Text(script.name).tag(script.id) }
+                            }
+                        }
+                        if binding.action == .repeatHold || binding.action == .repeatToggle {
+                            Stepper(value: Binding(
+                                get: { binding.repeatIntervalMs },
+                                set: { _ = mapping.setAction(key: key, rotation: rotation, action: binding.action, repeatIntervalMs: $0) }
+                            ), in: 40...5000, step: 20) {
+                                Text(t("连点间隔：\(binding.repeatIntervalMs) 毫秒", "Repeat interval: \(binding.repeatIntervalMs) ms", language))
+                            }
+                        }
+                        if binding.action == .swipe {
+                            Text(t("终点 X：\(Int(binding.endX * 100))%", "End X: \(Int(binding.endX * 100))%", language)).font(.caption)
+                            Slider(value: Binding(get: { binding.endX }, set: { _ = mapping.setSwipe(key: key, rotation: rotation, endX: $0, endY: binding.endY, durationMs: binding.durationMs) }), in: 0...1)
+                            Text(t("终点 Y：\(Int(binding.endY * 100))%", "End Y: \(Int(binding.endY * 100))%", language)).font(.caption)
+                            Slider(value: Binding(get: { binding.endY }, set: { _ = mapping.setSwipe(key: key, rotation: rotation, endX: binding.endX, endY: $0, durationMs: binding.durationMs) }), in: 0...1)
+                            Stepper(value: Binding(get: { binding.durationMs }, set: { _ = mapping.setSwipe(key: key, rotation: rotation, endX: binding.endX, endY: binding.endY, durationMs: $0) }), in: 40...10000, step: 20) {
+                                Text(t("滑动时长：\(binding.durationMs) 毫秒", "Swipe duration: \(binding.durationMs) ms", language))
+                            }
+                        }
+                        if binding.action == .gesture {
+                            if mapping.traceTarget != nil {
+                                Text(t("在屏幕上按住并拖动以录制轨迹。", "Press and drag on the screen to record a path.", language)).font(.caption).foregroundStyle(.secondary)
+                                Button(t("取消录制", "Cancel recording", language)) { mapping.cancelTrace() }
+                            } else {
+                                Button(t("录制轨迹", "Record path", language)) {
+                                    _ = mapping.beginTrace(key: key, rotation: rotation)
+                                }
+                            }
+                        }
+                        if binding.action == .fpsView || binding.action == .skillAim {
+                            Text(t("鼠标灵敏度：\(String(format: "%.1f", binding.sensitivity))", "Mouse sensitivity: \(String(format: "%.1f", binding.sensitivity))", language)).font(.caption)
+                            Slider(value: Binding(get: { binding.sensitivity }, set: { _ = mapping.setAim(key: key, rotation: rotation, sensitivity: $0, radius: binding.aimRadius, cancelX: binding.endX, cancelY: binding.endY) }), in: 0.1...5)
+                            Text(t("触控范围：\(Int(binding.aimRadius * 100))%", "Touch radius: \(Int(binding.aimRadius * 100))%", language)).font(.caption)
+                            Slider(value: Binding(get: { binding.aimRadius }, set: { _ = mapping.setAim(key: key, rotation: rotation, sensitivity: binding.sensitivity, radius: $0, cancelX: binding.endX, cancelY: binding.endY) }), in: 0.05...0.45)
+                            if binding.action == .skillAim {
+                                Text(t("右键取消时拖至游戏的取消区域；请设置该区域坐标。", "Right-click drags to the game's cancel area; set its position below.", language)).font(.caption).foregroundStyle(.secondary)
+                                Picker(t("额外取消键", "Additional cancel key", language), selection: Binding(
+                                    get: { binding.cancelKey ?? "" },
+                                    set: { _ = mapping.setSkillCancelKey(key: key, rotation: rotation, cancelKey: $0.isEmpty ? nil : $0) }
+                                )) {
+                                    Text(t("仅右键", "Right-click only", language)).tag("")
+                                    ForEach((Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789").map(String.init) + ["ESC", "SPACE", "TAB", "ENTER", "UP", "DOWN", "LEFT", "RIGHT"]).filter { $0 != key }, id: \.self) { candidate in
+                                        Text(MappingKey.displayLabel(candidate)).tag(candidate)
+                                    }
+                                }
+                                Text(t("取消位置 X：\(Int(binding.endX * 100))%", "Cancel X: \(Int(binding.endX * 100))%", language)).font(.caption)
+                                Slider(value: Binding(get: { binding.endX }, set: { _ = mapping.setAim(key: key, rotation: rotation, sensitivity: binding.sensitivity, radius: binding.aimRadius, cancelX: $0, cancelY: binding.endY) }), in: 0...1)
+                                Text(t("取消位置 Y：\(Int(binding.endY * 100))%", "Cancel Y: \(Int(binding.endY * 100))%", language)).font(.caption)
+                                Slider(value: Binding(get: { binding.endY }, set: { _ = mapping.setAim(key: key, rotation: rotation, sensitivity: binding.sensitivity, radius: binding.aimRadius, cancelX: binding.endX, cancelY: $0) }), in: 0...1)
+                            } else {
+                                Text(t("按绑定键捕获或释放鼠标。", "Press the bound key to capture or release the mouse.", language)).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }.padding(12)
+                }
             }
         }
     }
@@ -1511,6 +1600,24 @@ private struct KeyMappingSidePanel: View {
                                 options: profileMenuOptions
                             )
                             .frame(width: 158)
+                        }
+
+                        Toggle(t("按前台应用自动切换", "Switch with foreground app", language), isOn: Binding(
+                            get: { mapping.autoSwitchEnabled },
+                            set: { if !mapping.setAutoSwitch($0) { transport.onStatus?(mapping.associationError ?? t("无法保存应用关联", "Could not save app association", language)) } }
+                        )).disabled(mapping.associationError != nil)
+                        if let package = mapping.foregroundPackage {
+                            Text(package).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                            HStack {
+                                Button(t("关联当前方案", "Bind current profile", language)) {
+                                    if !mapping.associateForegroundWithCurrentProfile() { transport.onStatus?(mapping.associationError ?? t("无法保存应用关联", "Could not save app association", language)) }
+                                }
+                                if mapping.associatedProfile != nil {
+                                    Button(t("移除关联", "Remove binding", language)) { _ = mapping.removeForegroundAssociation() }
+                                }
+                            }
+                        } else {
+                            Text(t("等待前台应用信息…", "Waiting for foreground app…", language)).font(.caption).foregroundStyle(.secondary)
                         }
 
                         HStack(spacing: 10) {

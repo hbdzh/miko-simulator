@@ -298,8 +298,9 @@ guard let playerContent = preview.window?.contentView,
 }
 let expectedSidebarWidth = WbLayout.windowDeviceToolbarWidth
 let titleAccessories = chromeWindow.titlebarAccessoryViewControllers
-let sidebarTitleButton = titleAccessories.compactMap { $0.view as? NSButton }.first { $0.accessibilityLabel()?.localizedCaseInsensitiveContains("sidebar") == true }
-let compactActions = titleAccessories.first { !($0.view is NSButton) }
+let sidebarAccessory = titleAccessories.first { $0.view.subviews.contains { $0 is NSButton } }
+let sidebarTitleButton = sidebarAccessory?.view.subviews.compactMap { $0 as? NSButton }.first { $0.accessibilityLabel()?.localizedCaseInsensitiveContains("sidebar") == true }
+let compactActions = titleAccessories.first { $0 !== sidebarAccessory }
 require(titleAccessories.count == 2 && sidebarTitleButton != nil && compactActions != nil,
         "titlebar retains the sidebar and compact action controls")
 if let sidebarTitleButton, let compactActions {

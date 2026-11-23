@@ -107,6 +107,7 @@ fn validate_event(event: &Event, index: usize) -> MikoResult<()> {
         Event::ToolKey { key } => validate_tool_key(key, index),
         Event::Text { text } => validate_text(text, index),
         Event::Paste { text } => validate_text(text, index),
+        Event::ScriptCall { .. } => Ok(()),
     }
 }
 

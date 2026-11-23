@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::{Mutex, broadcast, oneshot};
+use tokio::sync::{Mutex, broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -106,11 +106,13 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 pub struct Client {
+    socket: PathBuf,
     writer: Mutex<OwnedWriteHalf>,
     pending: Pending,
     events: broadcast::Sender<Event>,
     next: AtomicU64,
     reader: JoinHandle<()>,
+    closed: watch::Receiver<bool>,
     hello: HelloResult,
 }
 
@@ -146,27 +148,31 @@ impl Client {
                 )
                 .with_data(json!({ "unavailable": is_unavailable(&e) }))
             })?;
-            Self::handshake(stream, client).await
+            Self::handshake(stream, client, socket.to_owned()).await
         })
         .await
         .map_err(|_| MikoError::unexpected("Miko daemon did not answer the handshake"))?
     }
 
-    async fn handshake(stream: UnixStream, client: &str) -> MikoResult<Self> {
+    async fn handshake(stream: UnixStream, client: &str, socket: PathBuf) -> MikoResult<Self> {
         let (r, w) = stream.into_split();
         let pending: Pending = Arc::default();
         let (events, _) = broadcast::channel(1024);
+        let (closed_tx, closed) = watch::channel(false);
         let reader = tokio::spawn(read_loop(
             BufReader::new(r),
             pending.clone(),
             events.clone(),
+            closed_tx,
         ));
         let mut c = Self {
+            socket,
             writer: Mutex::new(w),
             pending,
             events,
             next: AtomicU64::new(1),
             reader,
+            closed,
             hello: HelloResult {
                 version: String::new(),
                 protocol: String::new(),
@@ -219,6 +225,11 @@ impl Client {
     /// What the daemon said in `hello`.
     pub fn daemon(&self) -> &HelloResult {
         &self.hello
+    }
+
+    /// Socket used by this client, for independently scoped connections.
+    pub fn socket(&self) -> &Path {
+        &self.socket
     }
 
     /// Calls a method; JSON-RPC errors become `MikoError`s with their code.
@@ -342,6 +353,12 @@ impl Client {
     pub fn events(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
     }
+
+    /// Waits until the daemon connection closes, including if it has already closed.
+    pub async fn wait_closed(&self) {
+        let mut closed = self.closed.clone();
+        let _ = closed.wait_for(|value| *value).await;
+    }
 }
 
 /// The job id of a `{job, pending: true}` answer.
@@ -362,6 +379,7 @@ async fn read_loop(
     mut r: BufReader<tokio::net::unix::OwnedReadHalf>,
     pending: Pending,
     events: broadcast::Sender<Event>,
+    closed: watch::Sender<bool>,
 ) {
     let mut line = String::new();
     loop {
@@ -399,6 +417,7 @@ async fn read_loop(
     }
     // Wake every waiter: their senders drop here.
     pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let _ = closed.send(true);
 }
 
 /// Asks the daemon at `socket` to exit (allowed before `hello`) and waits for
@@ -495,10 +514,12 @@ mod tests {
         pending.lock().unwrap().insert(7, response);
         pending.lock().unwrap().insert(8, unanswered);
         let (events, mut receiver) = tokio::sync::broadcast::channel(16);
+        let (closed_tx, mut closed) = tokio::sync::watch::channel(false);
         let reading = tokio::spawn(super::read_loop(
             BufReader::new(reader),
             pending.clone(),
             events,
+            closed_tx,
         ));
         let payload = serde_json::json!({
             "z": [{ "text": "设备 العربية 🙂\n".repeat(4096), "n": u64::MAX }],
@@ -528,6 +549,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert!(*closed.borrow_and_update());
         let first = receiver.try_recv().unwrap();
         assert_eq!(first.topic, "first");
         assert_eq!(first.data, payload);

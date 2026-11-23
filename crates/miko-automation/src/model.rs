@@ -1,4 +1,4 @@
-//! The on-disk operation-recording format (v2), playback options and summaries.
+//! The in-memory playback timeline, options and recording summaries.
 //!
 //! A script is portable JSON: a normalized input timeline that the player
 //! bridge replays locally. See `docs/player-scripts.md` for the contract.
@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 /// Magic value of the operation-recording JSON format.
 pub const FORMAT: &str = "miko.operation-recording";
-/// Current format version; a script with another version is rejected.
-pub const VERSION: u32 = 2;
+/// Current storage format version. The store also imports versions 2 and 3.
+pub const VERSION: u32 = 4;
 
 /// Script name limit, in `char`s (the UI counts characters, not bytes).
 pub const MAX_NAME_CHARS: usize = 80;
@@ -73,6 +73,8 @@ pub enum Event {
     Paste { text: String },
     /// A player tool key (`back`, `home`, `volume_up`, …).
     ToolKey { key: String },
+    /// A script fragment reference, resolved before playback.
+    ScriptCall { script: Uuid },
 }
 
 impl Event {
@@ -91,6 +93,7 @@ impl Event {
                 !key.is_empty() && key.len() <= MAX_KEY_BYTES
             }
             Event::Text { text } | Event::Paste { text } => text.len() <= MAX_TEXT_BYTES,
+            Event::ScriptCall { .. } => false,
         }
     }
 }
@@ -181,17 +184,16 @@ impl Script {
         for timed in &self.events {
             match &timed.event {
                 Event::Touch { down, .. } => {
-                    if *down && !touch && mapped.is_empty() {
+                    if *down && !touch {
                         count += 1;
                     }
                     touch = *down;
                 }
                 Event::MappedTouch { id, down, .. } => {
                     if *down {
-                        if !touch && mapped.is_empty() {
+                        if mapped.insert(*id) {
                             count += 1;
                         }
-                        mapped.insert(*id);
                     } else {
                         mapped.remove(id);
                     }
@@ -205,7 +207,10 @@ impl Script {
                         keys.remove(key);
                     }
                 }
-                Event::Text { .. } | Event::Paste { .. } | Event::ToolKey { .. } => count += 1,
+                Event::Text { .. }
+                | Event::Paste { .. }
+                | Event::ToolKey { .. }
+                | Event::ScriptCall { .. } => count += 1,
             }
         }
         count
@@ -280,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn summaries_group_multitouch_and_count_keys_and_discrete_commands() {
+    fn summaries_count_each_touch_action_and_keys_and_discrete_commands() {
         let mut script = fixture();
         let mapped = |id, down| Event::MappedTouch {
             id,
@@ -324,7 +329,7 @@ mod tests {
             ),
             timed(14, Event::ToolKey { key: "home".into() }),
         ];
-        assert_eq!(script.summary().action_count, 7);
+        assert_eq!(script.summary().action_count, 8);
         assert_eq!(script.summary().event_count, 15);
     }
 
@@ -377,7 +382,7 @@ mod tests {
         ];
         let value = serde_json::to_value(&script).expect("serialise");
         assert_eq!(value["format"], "miko.operation-recording");
-        assert_eq!(value["version"], 2);
+        assert_eq!(value["version"], VERSION);
         assert_eq!(value["events"][0]["type"], "touch");
         assert_eq!(value["events"][0]["t"], 0);
         assert_eq!(value["events"][1]["type"], "mapped_touch");

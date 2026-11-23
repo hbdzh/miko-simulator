@@ -74,6 +74,42 @@ pub struct CreateParams {
     pub agent_owned: Option<bool>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InputReleaseParams {
+    pub device: String,
+    pub token: Uuid,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InputAcquireParams {
+    /// Device name or id.
+    pub device: String,
+    /// Owner cooperates with a manual takeover request.
+    #[serde(default)]
+    pub preemptible: bool,
+    /// Request the current preemptible owner to stop and release first.
+    #[serde(default)]
+    pub takeover: bool,
+}
+
+struct InputTakeoverGuard {
+    state: Arc<State>,
+    device: Uuid,
+    connection: u64,
+    request: Uuid,
+}
+impl Drop for InputTakeoverGuard {
+    fn drop(&mut self) {
+        crate::state::lock(&self.state.input_ownership).cancel_takeover(
+            self.device,
+            self.connection,
+            self.request,
+        );
+    }
+}
+
 /// `settings.set`: only the given fields change.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -752,7 +788,13 @@ impl CoreProvider {
             network_shaping: Default::default(),
         };
         if let Err(e) = self.state.with_store(|s| s.insert(device.clone())) {
-            let _ = avds.delete(&avd);
+            if let Err(cleanup) = avds.delete(&avd) {
+                return Err(MikoError::sdk(format!(
+                    "device creation cleanup failed for {}: {cleanup}",
+                    avds.dir(&avd).display()
+                ))
+                .with_data(json!({"cleanup_failed":true})));
+            }
             return Err(e);
         }
         self.state.emit(
@@ -886,7 +928,16 @@ impl CoreProvider {
         json(d)
     }
 
-    async fn clone_device(&self, p: CloneParams) -> MikoResult<Value> {
+    async fn clone_device(
+        &self,
+        p: CloneParams,
+        cancel: Option<miko_core::Cancel>,
+    ) -> MikoResult<Value> {
+        if cancel.is_some() && p.keep_snapshot.is_some() {
+            return Err(MikoError::usage(
+                "cancellable cloning does not support snapshots",
+            ));
+        }
         let src = self.state.device(&p.device).await?;
         if src.status.is_active() {
             return Err(MikoError::busy(format!(
@@ -913,10 +964,36 @@ impl CoreProvider {
                 Some(id)
             }
             None => {
-                avds.clone_avd(&src.avd, &avd, &name)?;
+                if let Some(cancel) = cancel.clone() {
+                    let avds = avds.clone();
+                    let src = src.avd.clone();
+                    let avd = avd.clone();
+                    let name = name.clone();
+                    tokio::task::spawn_blocking(move || {
+                        avds.clone_avd_cancellable(&src, &avd, &name, &cancel)
+                    })
+                    .await
+                    .map_err(|error| {
+                        MikoError::unexpected(format!("clone task failed: {error}"))
+                    })??;
+                } else {
+                    avds.clone_avd(&src.avd, &avd, &name)?;
+                }
                 None
             }
         };
+        if let Some(cancel) = &cancel
+            && let Err(error) = cancel.check()
+        {
+            avds.delete(&avd).map_err(|cleanup| {
+                MikoError::sdk(format!(
+                    "clone cleanup failed for {}: {cleanup}",
+                    avds.dir(&avd).display()
+                ))
+                .with_data(json!({"cleanup_failed":true}))
+            })?;
+            return Err(error);
+        }
         let dst_dir = avds.dir(&avd);
         let mut launch = src.launch.clone();
         let mut root = src.root.clone();
@@ -938,7 +1015,13 @@ impl CoreProvider {
             ..src
         };
         if let Err(e) = self.state.with_store(|s| s.insert(device.clone())) {
-            let _ = avds.delete(&avd);
+            if let Err(cleanup) = avds.delete(&avd) {
+                return Err(MikoError::sdk(format!(
+                    "clone cleanup failed for {}: {cleanup}",
+                    avds.dir(&avd).display()
+                ))
+                .with_data(json!({"cleanup_failed":true})));
+            }
             return Err(e);
         }
         self.state.emit(
@@ -1311,6 +1394,9 @@ impl CommandProvider for CoreProvider {
                 "Copy a stopped device under a new name; keep_snapshot makes a copy-on-write clone that resumes that snapshot",
             )
             .locks_device(),
+            CommandSpec::new::<CloneParams>("device.clone_task", "Copy a stopped device as a cancellable job")
+                .long_running()
+                .locks_device(),
             CommandSpec::new::<StartParams>(
                 "device.start",
                 "Start a device and wait until it has booted",
@@ -1322,6 +1408,9 @@ impl CommandProvider for CoreProvider {
                 "Stop a device, saving its quick-boot state",
             )
             .locks_device(),
+            CommandSpec::new::<DeviceParams>("device.stop_task", "Stop a device with cancellable preparation")
+                .long_running()
+                .locks_device(),
             CommandSpec::new::<DeviceParams>(
                 "device.hibernate",
                 "Save a running device's whole state and stop it; device.start resumes it in seconds",
@@ -1343,7 +1432,12 @@ impl CommandProvider for CoreProvider {
                 "device.connect_info",
                 "gRPC endpoint, token and adb serial of a running device",
             ),
+            CommandSpec::new::<InputAcquireParams>("input.acquire", "Acquire exclusive device input for this connection"),
+            CommandSpec::new::<InputReleaseParams>("input.release", "Release exclusive device input"),
             CommandSpec::new::<InstallParams>("file.install", "Install an APK on a running device")
+                .locks_device(),
+            CommandSpec::new::<InstallParams>("file.install_task", "Stage and install an APK as a cancellable job")
+                .long_running()
                 .locks_device(),
             CommandSpec::new::<PushParams>(
                 "file.push",
@@ -1378,6 +1472,69 @@ impl CommandProvider for CoreProvider {
 
     async fn call(&self, ctx: &CallCtx, method: &str, params: Value) -> MikoResult<Value> {
         match method {
+            "input.acquire" => {
+                let p: InputAcquireParams = parse_params(params)?;
+                if p.preemptible && p.takeover {
+                    return Err(MikoError::usage("a takeover owner cannot be preemptible"));
+                }
+                let device = self.state.device(&p.device).await?;
+                let connection = ctx
+                    .connection
+                    .ok_or_else(|| MikoError::usage("input ownership requires a connection"))?;
+                let result = {
+                    let mut ownership = crate::state::lock(&self.state.input_ownership);
+                    match ownership.acquire(device.id, connection, p.preemptible) {
+                        Ok(token) => Ok((Some(token), None)),
+                        Err(error) if p.takeover && error.code == miko_core::ErrorCode::Busy => {
+                            match ownership.begin_takeover(device.id, connection) {
+                                Ok(pending) => Ok((None, Some(pending))),
+                                Err(_) => Err(error),
+                            }
+                        }
+                        Err(error) => Err(error),
+                    }
+                }?;
+                let token = if let Some(token) = result.0 {
+                    token
+                } else {
+                    let (request, owner_token) = result
+                        .1
+                        .ok_or_else(|| MikoError::unexpected("invalid input handoff"))?;
+                    let _guard = InputTakeoverGuard {
+                        state: self.state.clone(),
+                        device: device.id,
+                        connection,
+                        request,
+                    };
+                    self.state.emit(
+                        "input.revoke",
+                        json!({"device":device.id,"token":owner_token}),
+                    );
+                    tokio::time::timeout(Duration::from_secs(15), async {
+                        loop {
+                            let next = crate::state::lock(&self.state.input_ownership)
+                                .finish_takeover(device.id, connection, request)?;
+                            if let Some(token) = next {
+                                return Ok(token);
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    })
+                    .await
+                    .map_err(|_| MikoError::busy("input handoff timed out"))??
+                };
+                Ok(json!({"token": token}))
+            }
+            "input.release" => {
+                let p: InputReleaseParams = parse_params(params)?;
+                let device = self.state.device(&p.device).await?;
+                let connection = ctx
+                    .connection
+                    .ok_or_else(|| MikoError::usage("input ownership requires a connection"))?;
+                crate::state::lock(&self.state.input_ownership)
+                    .release(device.id, connection, p.token)?;
+                Ok(json!({"released": true}))
+            }
             "daemon.status" => {
                 parse_params::<NoParams>(params)?;
                 let devices = self.state.devices().await;
@@ -1455,7 +1612,11 @@ impl CommandProvider for CoreProvider {
             }
             "device.create" => self.create(parse_params(params)?).await,
             "device.edit" => self.edit(parse_params(params)?).await,
-            "device.clone" => self.clone_device(parse_params(params)?).await,
+            "device.clone" => self.clone_device(parse_params(params)?, None).await,
+            "device.clone_task" => {
+                self.clone_device(parse_params(params)?, Some(ctx.cancel.clone()))
+                    .await
+            }
             "device.start" => {
                 let p: StartParams = parse_params(params)?;
                 let d = self.state.device(&p.device).await?;
@@ -1468,6 +1629,16 @@ impl CommandProvider for CoreProvider {
                 let p: DeviceParams = parse_params(params)?;
                 let d = self.state.device(&p.device).await?;
                 json(self.state.stop_device(d.id).await?)
+            }
+            "device.stop_task" => {
+                let p: DeviceParams = parse_params(params)?;
+                let d = self.state.device(&p.device).await?;
+                ctx.report(None, "Preparing to stop");
+                json(
+                    self.state
+                        .stop_device_cancellable(d.id, Some(&ctx.cancel))
+                        .await?,
+                )
             }
             "device.hibernate" => {
                 let p: DeviceParams = parse_params(params)?;
@@ -1533,6 +1704,66 @@ impl CommandProvider for CoreProvider {
                     .install(&p.apk, opts)
                     .await?;
                 Ok(json!({ "installed": p.apk }))
+            }
+            "file.install_task" => {
+                let p: InstallParams = parse_params(params)?;
+                ctx.cancel.check()?;
+                if !p.apk.is_file() {
+                    return Err(MikoError::usage(format!(
+                        "no such APK: {}",
+                        p.apk.display()
+                    )));
+                }
+                let d = self.state.device(&p.device).await?;
+                let adb = self.adb(&d).await?.with_timeout(Duration::from_secs(600));
+                let remote = format!("/data/local/tmp/miko-install-{}.apk", Uuid::new_v4());
+                let opts = InstallOptions {
+                    replace: p.replace,
+                    grant_permissions: p.grant_permissions,
+                    downgrade: p.downgrade,
+                };
+                ctx.report(None, "Staging APK");
+                let staged = adb.push_cancellable(&p.apk, &remote, &ctx.cancel).await;
+                let result = match staged {
+                    Ok(()) => match ctx.cancel.check() {
+                        Ok(()) => {
+                            ctx.report(None, "Installing APK");
+                            adb.install_staged(&remote, opts).await
+                        }
+                        Err(error) => Err(error),
+                    },
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = &result
+                    && error
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("outcome_unknown"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                {
+                    return Err(MikoError::sdk(format!(
+                        "{}; staged APK retained at {remote}",
+                        error.message
+                    ))
+                    .with_data(json!({"outcome_unknown":true,"staged_apk":remote})));
+                }
+                let cleanup = adb.shell(&format!("rm -f {remote}")).await;
+                if let Err(cleanup) = cleanup {
+                    let outcome = match &result {
+                        Ok(()) => "APK installed",
+                        Err(error) if miko_core::cancel::is_cancelled(error) => {
+                            "installation stopped before commit"
+                        }
+                        Err(_) => "installation did not report success",
+                    };
+                    return Err(MikoError::sdk(format!(
+                        "{outcome}; staged APK cleanup failed at {remote}: {cleanup}"
+                    ))
+                    .with_data(json!({"cleanup_failed":true})));
+                }
+                result?;
+                Ok(json!({"installed": p.apk}))
             }
             "file.push" => {
                 let p: PushParams = parse_params(params)?;

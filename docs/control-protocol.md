@@ -340,6 +340,16 @@ Copy a stopped device under a new name; keep_snapshot makes a copy-on-write clon
 | `name` | string | yes | Name of the copy. |
 | `keep_snapshot` | string |  | Keep this snapshot (name or id): a copy-on-write clone whose first start resumes it, in seconds (D42). Without it the copy cold-boots. |
 
+#### `device.clone_task`
+
+Copy a stopped device as a cancellable job · long-running (job) · locks the device
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `device` | string | yes | Device to copy (must be stopped). |
+| `name` | string | yes | Name of the copy. |
+| `keep_snapshot` | string |  | Keep this snapshot (name or id): a copy-on-write clone whose first start resumes it, in seconds (D42). Without it the copy cold-boots. |
+
 #### `device.connect_info`
 
 gRPC endpoint, token and adb serial of a running device
@@ -469,6 +479,14 @@ Stop a device, saving its quick-boot state · locks the device
 |---|---|---|---|
 | `device` | string | yes | Device name or id. |
 
+#### `device.stop_task`
+
+Stop a device with cancellable preparation · long-running (job) · locks the device
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `device` | string | yes | Device name or id. |
+
 ### `file.*`
 
 #### `file.flash`
@@ -483,6 +501,18 @@ Flash a zip: a Magisk or Zygisk module installs and reboots a Full-root device; 
 #### `file.install`
 
 Install an APK on a running device · locks the device
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `device` | string | yes |  |
+| `apk` | string | yes | Path of the APK on this machine. |
+| `replace` | boolean |  | Replace an installed app (`-r`). |
+| `grant_permissions` | boolean |  | Grant runtime permissions (`-g`). |
+| `downgrade` | boolean |  | Allow a version downgrade (`-d`). |
+
+#### `file.install_task`
+
+Stage and install an APK as a cancellable job · long-running (job) · locks the device
 
 | Param | Type | Required | Description |
 |---|---|---|---|
@@ -570,6 +600,44 @@ Touch the sensor with an enrolled finger (recognised) or another (unrecognised)
 |---|---|---|---|
 | `device` | string | yes |  |
 | `finger` | integer |  | Enrolled finger id (1–10). `touch` only. |
+
+### `flow.*`
+
+#### `flow.control`
+
+Pause, resume, step or stop a workflow
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `device` | string | yes |  |
+| `command` | string | yes |  |
+
+#### `flow.run`
+
+Run a conditional workflow on one device · long-running (job)
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `device` | string | yes |  |
+| `flow` | Flow | yes |  |
+| `start_paused` | boolean |  |  |
+| `screenshots` | boolean |  |  |
+
+#### `flow.status`
+
+Get the device workflow state
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `device` | string | yes |  |
+
+#### `flow.validate`
+
+Validate a conditional workflow
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `flow` | Flow | yes |  |
 
 ### `gps.*`
 
@@ -688,6 +756,16 @@ Remove an unused image from a Miko-owned SDK · **destructive**
 
 ### `input.*`
 
+#### `input.acquire`
+
+Acquire exclusive device input for this connection
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `device` | string | yes | Device name or id. |
+| `preemptible` | boolean |  | Owner cooperates with a manual takeover request. |
+| `takeover` | boolean |  | Request the current preemptible owner to stop and release first. |
+
 #### `input.gamepad.connect`
 
 Forward a game controller on this computer to the device until input.gamepad.disconnect · long-running (job)
@@ -718,6 +796,15 @@ Whether a game controller is being forwarded to the device
 List the game controllers connected to this computer
 
 No params.
+
+#### `input.release`
+
+Release exclusive device input
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `device` | string | yes |  |
+| `token` | uuid | yes |  |
 
 ### `jobs.*`
 
@@ -764,6 +851,7 @@ Press a hardware key (back, home, volume, D-pad, media…)
 |---|---|---|---|
 | `device` | string | yes |  |
 | `key` | string | yes | `back`, `home`, `recents`, `volume_up`, `volume_down`, `mute`, `power`, `menu`, `dpad_up\|down\|left\|right\|center`, `play_pause`, `next`, `previous`, `enter`, `delete`, or any W3C key name. |
+| `input_lease` | uuid |  | Existing device input ownership, when invoked by a player bridge. |
 
 ### `logcat.*`
 
@@ -1276,6 +1364,12 @@ Snapshot warnings report low resources, incomplete or unclean sessions, and `sto
 
 | Version | Change |
 |---|---|
+| 0.1 (additive) | `host.budget` 的设备项增加可选 `cpu_percent`：模拟器进程树最近一次 CPU 采样的整数百分比，100 表示一个逻辑核心；不可测量时省略。采样周期约 30 秒。 |
+| 0.1 (additive) | 新增 `device.stop_task` 和 `file.install_task`，供批量操作请求取消：停止在快照保存完成后、最终关机前检查取消；安装在暂存传输期间可取消，进入 Android 安装提交后报告实际结果，连接中断时报告结果不明并保留暂存文件路径。临时文件清理失败作为失败报告。原有 `device.stop`、`file.install` 接口保持不变。 |
+| 0.1 (additive) | 新增 `device.clone_task`，通过任务接口运行可取消的普通克隆；取消时清理未完成的目标，清理失败报告为任务失败。`device.clone` 保持原有同步结果和快照克隆行为。 |
+| 0.1 (fix) | 普通 `device.clone` 复制前按将复制文件的逻辑大小加 1 GiB 余量检查可用磁盘空间；不足时返回 `sdk` 错误，未创建副本。 |
+| 0.1 (additive) | `input.acquire {device, preemptible?, takeover?}` 返回连接绑定的输入所有权 token；可接管的所有者会收到 `input.revoke` 事件，必须完成触点和按键释放并调用 `input.release` 后，等待中的手动输入才获得所有权。daemon 管理的界面流程及手柄转发收到接管请求时取消并清理输入；单次 `key.press` 完成按键释放后交接。等待最多 15 秒，失败返回 `busy`。`input.release {device, token}` 在输入释放后交还；`key.press` 可携带 `input_lease` 复用本连接持有的所有权。所有权冲突返回 `busy`；异常断连或释放结果不确定时，停止设备后才解除保护。 |
+| 0.1 (additive) | `input.acquire {device}` 返回连接绑定的输入所有权 token，`input.release {device, token}` 在输入释放后交还；`key.press` 可携带 `input_lease` 复用本连接持有的所有权。所有权冲突返回 `busy`；异常断连或释放结果不确定时，停止设备后才解除保护。 |
 | 0.1 (breaking) | Reserved pool and hibernation snapshot identifiers change to `miko-base` and `miko-hibernate`; operation recordings use format `miko.operation-recording`, version 2. CLI JSON envelopes use `miko_json` version 2. Existing data and older clients require an update. |
 | 0.1 (deployment) | The default socket moves to the miko data directory; `MIKO_HOME` replaces `MIKO_HOME` for isolated roots. The local GUI bridge uses `miko_sdk` for the writable SDK configuration; existing daemon protocol methods and payloads are unchanged. |
 | 0.1 (additive) | Input synchronizer (D45): `sync.start`, `sync.stop`, `sync.status`, `sync.add_follower`, `sync.remove_follower`, `sync.set_leader`, `sync.set_options` and `sync.report` manage one session in which a leader device's input is mirrored on running follower devices; events `sync.state` and `sync.follower_error`. No new error codes: `usage`, `not_found` and `busy` are used. The session ends when the leader stops, crashes, hibernates or is deleted, or no follower is left. See [sync.md](sync.md). |

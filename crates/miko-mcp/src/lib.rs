@@ -34,11 +34,205 @@ const NOT_CALLABLE: &[&str] = &[
     "events.subscribe",
     "logcat.follow",
     "daemon.shutdown",
+    "input.acquire",
+    "input.release",
 ];
 const DEFAULT_RUN_TIMEOUT_S: u64 = 900;
 const UI_DUMP_LIMIT: usize = 400_000;
 /// The Mac as the emulator sees it: where Burp or mitmproxy listens.
 const PROXY_HOST: &str = "10.0.2.2";
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+    use miko_daemon::testing::TestDaemon;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn server_shutdown_cancels_and_waits_for_input_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = TestDaemon::start(tmp.path()).await.unwrap();
+        let agent = Client::connect(&daemon.paths.socket(), "agent")
+            .await
+            .unwrap();
+        let player = Client::connect(&daemon.paths.socket(), "player")
+            .await
+            .unwrap();
+        player
+            .call("device.create", json!({"name":"P","image":"35"}))
+            .await
+            .unwrap();
+        let mcp = MikoMcp::new(agent, McpOptions::default());
+        let tasks = mcp.input_tasks.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        let (released_tx, released_rx) = oneshot::channel();
+        let request = tokio::spawn(async move {
+            mcp.run_input("P", move |mut cancel| async move {
+                let _ = started_tx.send(());
+                cancel.changed().await.unwrap();
+                let _ = cancelled_tx.send(());
+                released_rx.await.unwrap();
+                Ok(())
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        let shutdown = tokio::spawn({
+            let tasks = tasks.clone();
+            async move { tasks.shutdown().await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), cancelled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!shutdown.is_finished());
+        assert!(tasks.begin().is_none());
+        released_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(request.await.unwrap().is_err());
+        let lease = player
+            .call("input.acquire", json!({"device":"P"}))
+            .await
+            .unwrap();
+        player
+            .call(
+                "input.release",
+                json!({"device":"P","token":lease["token"]}),
+            )
+            .await
+            .unwrap();
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn dropped_request_finishes_release_before_unlocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = TestDaemon::start(tmp.path()).await.unwrap();
+        let agent = Client::connect(&daemon.paths.socket(), "agent")
+            .await
+            .unwrap();
+        let player = Client::connect(&daemon.paths.socket(), "player")
+            .await
+            .unwrap();
+        player
+            .call("device.create", json!({"name":"P","image":"35"}))
+            .await
+            .unwrap();
+        let mcp = MikoMcp::new(agent, McpOptions::default());
+        let tasks = mcp.input_tasks.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        let (released_tx, released_rx) = oneshot::channel();
+        let request = tokio::spawn(async move {
+            mcp.run_input("P", move |mut cancel| async move {
+                let _ = started_tx.send(());
+                cancel.changed().await.unwrap();
+                let _ = cancelled_tx.send(());
+                released_rx.await.unwrap();
+                Ok(())
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        request.abort();
+        tokio::time::timeout(Duration::from_secs(2), cancelled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            player
+                .call("input.acquire", json!({"device":"P"}))
+                .await
+                .unwrap_err()
+                .code,
+            miko_core::ErrorCode::Busy
+        );
+        released_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), tasks.shutdown())
+            .await
+            .unwrap();
+        let lease = player
+            .call("input.acquire", json!({"device":"P"}))
+            .await
+            .unwrap();
+        player
+            .call(
+                "input.release",
+                json!({"device":"P","token":lease["token"]}),
+            )
+            .await
+            .unwrap();
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn takeover_waits_for_cancelled_operation_to_finish_releasing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = TestDaemon::start(tmp.path()).await.unwrap();
+        let agent = Client::connect(&daemon.paths.socket(), "agent")
+            .await
+            .unwrap();
+        let player = Arc::new(
+            Client::connect(&daemon.paths.socket(), "player")
+                .await
+                .unwrap(),
+        );
+        player
+            .call("device.create", json!({"name":"P","image":"35"}))
+            .await
+            .unwrap();
+        let mcp = MikoMcp::new(agent, McpOptions::default());
+        let (started_tx, started_rx) = oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        let (released_tx, released_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            mcp.run_input("P", move |mut cancel| async move {
+                let _ = started_tx.send(());
+                cancel.changed().await.unwrap();
+                let _ = cancelled_tx.send(());
+                released_rx.await.unwrap();
+                Ok(())
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        let takeover = {
+            let player = player.clone();
+            tokio::spawn(async move {
+                player
+                    .call("input.acquire", json!({"device":"P","takeover":true}))
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), cancelled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !takeover.is_finished(),
+            "input must remain owned until release completes"
+        );
+        released_tx.send(()).unwrap();
+        assert!(task.await.unwrap().is_err());
+        let lease = tokio::time::timeout(Duration::from_secs(2), takeover)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        player
+            .call(
+                "input.release",
+                json!({"device":"P","token":lease["token"]}),
+            )
+            .await
+            .unwrap();
+        daemon.stop().await;
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct McpOptions {
@@ -49,6 +243,52 @@ pub struct McpOptions {
 pub struct MikoMcp {
     client: Arc<Client>,
     opts: McpOptions,
+    input_tasks: Arc<InputTasks>,
+}
+
+struct InputTasks {
+    state: std::sync::Mutex<(bool, usize)>,
+    finished: tokio::sync::Notify,
+    shutdown: tokio::sync::watch::Sender<bool>,
+}
+
+impl InputTasks {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new((false, 0)),
+            finished: tokio::sync::Notify::new(),
+            shutdown: tokio::sync::watch::channel(false).0,
+        }
+    }
+
+    async fn shutdown(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).0 = true;
+        self.shutdown.send_replace(true);
+        loop {
+            let finished = self.finished.notified();
+            if self.state.lock().unwrap_or_else(|e| e.into_inner()).1 == 0 {
+                return;
+            }
+            finished.await;
+        }
+    }
+
+    fn begin(self: &Arc<Self>) -> Option<InputTaskGuard> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.0 {
+            return None;
+        }
+        state.1 += 1;
+        Some(InputTaskGuard(self.clone()))
+    }
+}
+
+struct InputTaskGuard(Arc<InputTasks>);
+impl Drop for InputTaskGuard {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap_or_else(|e| e.into_inner()).1 -= 1;
+        self.0.finished.notify_one();
+    }
 }
 
 impl std::fmt::Debug for MikoMcp {
@@ -61,15 +301,18 @@ impl std::fmt::Debug for MikoMcp {
 
 /// Serves MCP on stdin/stdout until the client disconnects.
 pub async fn serve_stdio(client: Client, opts: McpOptions) -> MikoResult<()> {
-    let service = MikoMcp::new(client, opts)
+    let handler = MikoMcp::new(client, opts);
+    let input_tasks = handler.input_tasks.clone();
+    let service = handler
         .serve(rmcp::transport::stdio())
         .await
         .map_err(|e| MikoError::unexpected(format!("MCP initialize failed: {e}")))?;
-    service
+    let result = service
         .waiting()
         .await
-        .map_err(|e| MikoError::unexpected(format!("MCP server: {e}")))?;
-    Ok(())
+        .map_err(|e| MikoError::unexpected(format!("MCP server: {e}")));
+    input_tasks.shutdown().await;
+    result.map(|_| ())
 }
 
 // ---- tool params --------------------------------------------------------
@@ -319,6 +562,7 @@ impl MikoMcp {
         Self {
             client: Arc::new(client),
             opts,
+            input_tasks: Arc::new(InputTasks::new()),
         }
     }
 
@@ -453,6 +697,119 @@ impl MikoMcp {
             .call_as("device.connect_info", json!({ "device": selector }))
             .await?;
         Ok(DeviceIo::new(info))
+    }
+
+    async fn run_input<T, F, Fut>(&self, device: &str, operation: F) -> MikoResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(tokio::sync::watch::Receiver<bool>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = MikoResult<T>> + Send + 'static,
+    {
+        let socket = self.client.socket().to_owned();
+        let device = device.to_owned();
+        // Dropping the request signals cancellation but must not drop the
+        // input future: it may still need to send a touch-up to Android.
+        let (request_alive, mut request_closed) = tokio::sync::oneshot::channel::<()>();
+        let tasks = self.input_tasks.clone();
+        let mut shutdown = tasks.shutdown.subscribe();
+        let guard = tasks.begin().ok_or_else(miko_core::cancel::cancelled)?;
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            Self::run_owned_input(
+                &socket,
+                &device,
+                operation,
+                &mut request_closed,
+                &mut shutdown,
+            )
+            .await
+        });
+        let result = task
+            .await
+            .map_err(|error| MikoError::unexpected(format!("input task failed: {error}")))?;
+        drop(request_alive);
+        result
+    }
+
+    async fn run_owned_input<T, F, Fut>(
+        socket: &std::path::Path,
+        device: &str,
+        operation: F,
+        request_closed: &mut tokio::sync::oneshot::Receiver<()>,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> MikoResult<T>
+    where
+        F: FnOnce(tokio::sync::watch::Receiver<bool>) -> Fut,
+        Fut: std::future::Future<Output = MikoResult<T>>,
+    {
+        // A separate connection makes cancellation and parallel MCP calls
+        // independently owned. A failed action leaves the owner abandoned.
+        let client = Client::connect(socket, "miko-mcp-input").await?;
+        let mut events = client.subscribe(&["input.revoke"]).await?;
+        let acquired = client
+            .call("input.acquire", json!({"device":device,"preemptible":true}))
+            .await?;
+        let token = acquired["token"]
+            .as_str()
+            .ok_or_else(|| MikoError::unexpected("invalid input ownership reply"))?;
+        if *shutdown.borrow()
+            || matches!(
+                request_closed.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            )
+        {
+            client
+                .call("input.release", json!({"device":device,"token":token}))
+                .await?;
+            return Err(miko_core::cancel::cancelled());
+        }
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let operation = operation(cancelled);
+        tokio::pin!(operation);
+        let mut revoked = false;
+        let mut connection_error = None;
+        let result = loop {
+            tokio::select! {
+                result = &mut operation => break result?,
+                _ = &mut *request_closed, if !revoked => {
+                    revoked = true;
+                    let _ = cancel.send(true);
+                },
+                changed = shutdown.changed(), if !revoked => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        revoked = true;
+                        let _ = cancel.send(true);
+                    }
+                },
+                event = events.recv(), if !revoked => match event {
+                    Ok(event) if event.topic == "input.revoke" && event.data["token"].as_str() == Some(token) => {
+                        revoked = true;
+                        let _ = cancel.send(true);
+                    }
+                    Ok(_) => {},
+                    Err(error) => {
+                        revoked = true;
+                        connection_error = Some(MikoError::unexpected(format!("input handoff event failed: {error}")));
+                        let _ = cancel.send(true);
+                    },
+                },
+                () = client.wait_closed(), if connection_error.is_none() => {
+                    revoked = true;
+                    connection_error = Some(MikoError::unexpected("input ownership connection closed"));
+                    let _ = cancel.send(true);
+                },
+            }
+        };
+        if let Some(error) = connection_error {
+            return Err(error);
+        }
+        client
+            .call("input.release", json!({"device":device,"token":token}))
+            .await?;
+        if revoked {
+            return Err(miko_core::cancel::cancelled());
+        }
+        Ok(result)
     }
 
     /// D5: destructive commands need `--allow-destructive` or an agent-owned device.
@@ -614,7 +971,8 @@ impl MikoMcp {
                 let a: TapArgs = parse(args)?;
                 let io = self.io(&a.device).await?;
                 let (x, y) = self.point(&io, a.x, a.y, a.coords).await?;
-                io.tap(x, y).await?;
+                self.run_input(&a.device, move |_| async move { io.tap(x, y).await })
+                    .await?;
                 Ok(ok_json(json!({ "tapped": { "x": x, "y": y } })))
             }
             "swipe" => {
@@ -622,24 +980,42 @@ impl MikoMcp {
                 let io = self.io(&a.device).await?;
                 let from = self.point(&io, a.x1, a.y1, a.coords).await?;
                 let to = self.point(&io, a.x2, a.y2, a.coords).await?;
-                io.swipe(from, to, a.duration_ms.unwrap_or(300).clamp(10, 10_000))
-                    .await?;
+                self.run_input(&a.device, move |cancel| async move {
+                    io.swipe(
+                        from,
+                        to,
+                        a.duration_ms.unwrap_or(300).clamp(10, 10_000),
+                        cancel,
+                    )
+                    .await
+                })
+                .await?;
                 Ok(ok_json(
                     json!({ "swiped": { "from": [from.0, from.1], "to": [to.0, to.1] } }),
                 ))
             }
             "type_text" => {
                 let a: TypeArgs = parse(args)?;
+                device::validate_input_text(&a.text)?;
                 let io = self.io(&a.device).await?;
-                io.type_text(&a.text).await?;
-                if a.enter {
-                    io.press_key("Enter").await?;
-                }
+                let text = a.text.clone();
+                let enter = a.enter;
+                self.run_input(&a.device, move |cancel| async move {
+                    io.type_text(&text).await?;
+                    if enter && !*cancel.borrow() {
+                        io.press_key("Enter").await?;
+                    }
+                    Ok(())
+                })
+                .await?;
                 Ok(ok_json(json!({ "typed": a.text.chars().count() })))
             }
             "press_key" => {
                 let a: KeyArgs = parse(args)?;
-                self.io(&a.device).await?.press_key(&a.key).await?;
+                let io = self.io(&a.device).await?;
+                let key = a.key.clone();
+                self.run_input(&a.device, move |_| async move { io.press_key(&key).await })
+                    .await?;
                 Ok(ok_json(json!({ "pressed": a.key })))
             }
             "ui_dump" => {

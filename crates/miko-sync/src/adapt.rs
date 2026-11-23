@@ -27,6 +27,7 @@ pub fn allows(event: &Event, options: &SyncOptions) -> bool {
         Event::Key { .. } => options.sync_keyboard,
         Event::Text { .. } | Event::Paste { .. } => options.sync_text,
         Event::ToolKey { .. } => options.sync_tool_keys,
+        Event::ScriptCall { .. } => false,
     }
 }
 

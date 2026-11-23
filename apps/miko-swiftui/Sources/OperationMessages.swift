@@ -33,6 +33,13 @@ enum OperationMessages {
                 : "当前 Vulkan 应用无法保存到快速启动快照。请在安卓中退出应用后重试。"
         }
         guard language != 0 else { return value }
+        if value.hasPrefix("installation result unknown; check the device before retrying") {
+            return "安装结果无法确认，请先检查设备中的应用状态，再决定是否重试。\n\(value)"
+        }
+        if value.contains("staged APK cleanup failed") {
+            let outcome = value.hasPrefix("APK installed") ? "APK 已安装，但临时文件清理失败。" : "APK 安装未确认成功，临时文件清理失败。"
+            return "\(outcome)\n\(value)"
+        }
         let stoppedSuffix = " is not running; start it first"
         if value.hasSuffix(stoppedSuffix) {
             let name = String(value.dropLast(stoppedSuffix.count))
@@ -128,6 +135,9 @@ enum OperationMessages {
             "su didn't answer as root; cold booting once more":"Root 暂未响应，正在再次冷启动",
             "Play Store: open the Magisk app to finish its setup, then grant root to Shell":"请在设备中打开 Magisk 完成设置，然后为 Shell 授权",
             "Saving memory and disk":"正在保存内存和磁盘状态",
+            "Preparing to stop":"正在准备停止设备",
+            "Staging APK":"正在传输 APK",
+            "Installing APK":"正在安装 APK",
             "Starting emulator":"正在启动模拟器",
             "Connecting emulator control":"正在连接模拟器控制通道",
             "Waiting for Android boot":"正在等待 Android 系统启动",

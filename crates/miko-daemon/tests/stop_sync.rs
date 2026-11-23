@@ -84,6 +84,59 @@ async fn stop_syncs_guest_storage_before_shutdown() {
 }
 
 #[tokio::test]
+async fn cancellable_stop_waits_for_snapshot_and_preserves_running_device() {
+    let h = Harness::start().await;
+    let mut c = h.client().await;
+    c.ok("device.create", json!({"name":"S","image":"35"}))
+        .await;
+    c.run("device.start", json!({"device":"S"})).await;
+    let gate = h.backend.gate_snapshots();
+    let job = c.ok("device.stop_task", json!({"device":"S"})).await;
+    wait_for("snapshot save", || !h.backend.saves().is_empty()).await;
+    c.ok("jobs.cancel", json!({"job":job["job"]})).await;
+    let pending = c
+        .ok("jobs.wait", json!({"job":job["job"],"timeout_s":1}))
+        .await;
+    assert_eq!(pending["state"], "running");
+    gate.add_permits(1);
+    let result = c.wait_job(&job["job"]).await;
+    assert_eq!(result["state"], "cancelled");
+    assert_eq!(h.backend.running().len(), 1);
+    gate.add_permits(1);
+    c.ok("device.stop", json!({"device":"S"})).await;
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn cancellation_after_shutdown_begins_reports_actual_success() {
+    let h = Harness::start().await;
+    let mut c = h.client().await;
+    c.ok("device.create", json!({"name":"S","image":"35"}))
+        .await;
+    c.run("device.start", json!({"device":"S"})).await;
+    let gate = h.backend.gate_stops();
+    let job = c.ok("device.stop_task", json!({"device":"S"})).await;
+    let mut poll = h.client().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let devices = poll.ok("device.list", json!({})).await;
+            if devices[0]["status"]["state"] == "stopping" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    c.ok("jobs.cancel", json!({"job":job["job"]})).await;
+    gate.add_permits(1);
+    let result = c.wait_job(&job["job"]).await;
+    assert_eq!(result["state"], "succeeded");
+    assert!(h.backend.running().is_empty());
+    h.stop().await;
+}
+
+#[tokio::test]
 async fn stop_goes_ahead_when_the_guest_sync_fails() {
     let h = Harness::start().await;
     let mut c = h.client().await;

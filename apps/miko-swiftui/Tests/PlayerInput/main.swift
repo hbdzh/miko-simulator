@@ -32,5 +32,9 @@ precondition(PlayerTouch.secondFinger(.pinch, x: -0.1, y: 0.5, shownWidth: 720, 
 precondition(PlayerTouch.secondFinger(.pinch, x: 0.5, y: 0.5, shownWidth: 0, shownHeight: 1280) == nil)
 precondition(PlayerTouch.secondFinger(.pinch, x: .nan, y: 0.5, shownWidth: 720, shownHeight: 1280) == nil)
 precondition(PlayerTouch.secondFingerID == 3)
+precondition(PlayerInputOwnership.releasesBeforeToolbarAction("tool_key"))
+precondition(PlayerInputOwnership.releasesBeforeToolbarAction("rotate"))
+precondition(!PlayerInputOwnership.releasesBeforeToolbarAction("mapped_touch"))
+precondition(!PlayerInputOwnership.releasesBeforeToolbarAction("script_play_stop"))
 
 print("Player input tests passed")

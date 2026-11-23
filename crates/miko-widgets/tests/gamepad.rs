@@ -102,3 +102,41 @@ async fn gamepad_commands_check_the_device_and_report_no_controller() {
 
     d.stop().await;
 }
+
+#[tokio::test]
+async fn failed_gamepad_setup_releases_input_ownership() {
+    let tmp = tempfile::tempdir().unwrap();
+    let daemon = TestDaemon::start_with_providers(tmp.path(), vec![miko_widgets::provider()])
+        .await
+        .unwrap();
+    let cli = Client::connect(&daemon.paths.socket(), "cli")
+        .await
+        .unwrap();
+    let player = Client::connect(&daemon.paths.socket(), "player")
+        .await
+        .unwrap();
+    cli.call("device.create", json!({"name":"P","image":"35"}))
+        .await
+        .unwrap();
+    cli.run("device.start", json!({"device":"P"}), |_| {})
+        .await
+        .unwrap();
+    std::fs::remove_file(tmp.path().join("studio/platform-tools/adb")).unwrap();
+    assert!(
+        cli.run("input.gamepad.connect", json!({"device":"P"}), |_| {})
+            .await
+            .is_err()
+    );
+    let lease = player
+        .call("input.acquire", json!({"device":"P"}))
+        .await
+        .unwrap();
+    player
+        .call(
+            "input.release",
+            json!({"device":"P","token":lease["token"]}),
+        )
+        .await
+        .unwrap();
+    daemon.stop().await;
+}

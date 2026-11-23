@@ -18,6 +18,9 @@ pub struct KeyParams {
     /// `power`, `menu`, `dpad_up|down|left|right|center`, `play_pause`,
     /// `next`, `previous`, `enter`, `delete`, or any W3C key name.
     pub key: String,
+    /// Existing device input ownership, when invoked by a player bridge.
+    #[serde(default)]
+    pub input_lease: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

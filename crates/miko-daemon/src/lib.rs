@@ -5,8 +5,11 @@
 pub mod budget;
 pub mod bundle;
 pub mod core_provider;
+mod flow;
+mod flow_device;
 pub mod hibernate;
 pub mod idle;
+mod input_ownership;
 pub mod input_sync;
 pub mod jobs;
 pub mod leases;
@@ -103,6 +106,7 @@ impl DaemonBuilder {
         registry.register(Arc::new(pool::PoolProvider::new(state.clone())))?;
         registry.register(Arc::new(sync::SyncProvider::new(state.clone())))?;
         registry.register(Arc::new(input_sync::InputSyncProvider::new(state.clone())))?;
+        registry.register(Arc::new(flow::FlowProvider::default()))?;
         for p in self.providers {
             registry.register(p)?;
         }

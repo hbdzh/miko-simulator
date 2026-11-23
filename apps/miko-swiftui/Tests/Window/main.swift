@@ -24,6 +24,18 @@ if let window = player?.window, let visible = window.screen?.visibleFrame {
                  "new player window must use the screen-relative default height")
 }
 
+// Exercise the AppKit animated screen transition, including displays with
+// different backing scales. The original crash occurred inside this layout.
+if let window = player?.window, let first = window.screen,
+   let other = NSScreen.screens.first(where: { $0 != first }) {
+    var moved = window.frame
+    moved.origin = NSPoint(x: other.visibleFrame.midX - moved.width / 2,
+                           y: other.visibleFrame.midY - moved.height / 2)
+    window.setFrame(moved, display: true, animate: true)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+    precondition(window.screen == other, "player must survive moving to the other display")
+}
+
 player?.window?.performClose(nil)
 precondition(closeCount == 1 && player == nil)
 RunLoop.main.run(until:Date().addingTimeInterval(0.2))
@@ -61,7 +73,8 @@ precondition(abs(restored.window!.frame.height - restored.window!.contentLayoutR
 let title = restored.window!.contentView!.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "miko.player.title" }!
 let titleFrame = title.convert(title.bounds, to: nil)
 precondition(abs(titleFrame.midY - trafficCenter) < 1, "window title shares the traffic lights' vertical center")
-precondition(titleFrame.maxX <= accessories.map { $0.view.convert($0.view.bounds, to: nil).minX }.min()!, "window title never overlaps actions")
+let actionsMinX = accessories.map { $0.view.convert($0.view.bounds, to: nil).minX }.min()!
+precondition(titleFrame.maxX <= actionsMinX, "window title never overlaps actions: title=\(titleFrame), actions=\(accessories.map { $0.view.convert($0.view.bounds, to: nil) }), window=\(restored.window!.frame)")
 precondition(title.lineBreakMode == .byTruncatingTail, "long device names are truncated")
 precondition(NSImage(systemSymbolName: "hand.tap", accessibilityDescription: nil) != nil)
 restored.toggleSidebarFromMenu()

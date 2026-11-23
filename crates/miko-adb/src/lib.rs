@@ -231,6 +231,84 @@ impl Adb {
         }
     }
 
+    /// Stage an APK without starting package installation. Cancellation waits
+    /// for the local adb process to exit before returning.
+    pub async fn push_cancellable(
+        &self,
+        local: &Path,
+        remote: &str,
+        cancel: &miko_core::Cancel,
+    ) -> MikoResult<()> {
+        cancel.check()?;
+        let mut child = self
+            .command(&["push", &local.to_string_lossy(), remote])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| MikoError::sdk(format!("cannot start adb push: {e}")))?;
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|e| MikoError::sdk(format!("waiting for adb push: {e}")))?
+            {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(MikoError::sdk(format!("adb push failed: {status}")))
+                };
+            }
+            if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                child
+                    .kill()
+                    .await
+                    .map_err(|e| MikoError::sdk(format!("stopping adb push: {e}")))?;
+                if cancel.is_cancelled() {
+                    return Err(miko_core::cancel::cancelled());
+                }
+                return Err(MikoError::sdk("adb push timed out"));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Install an already staged APK. Once this begins its real outcome must
+    /// be awaited; losing the connection cannot establish whether it committed.
+    pub async fn install_staged(&self, remote: &str, opts: InstallOptions) -> MikoResult<()> {
+        let mut args = vec!["shell", "pm", "install"];
+        if opts.replace {
+            args.push("-r");
+        }
+        if opts.grant_permissions {
+            args.push("-g");
+        }
+        if opts.downgrade {
+            args.push("-d");
+        }
+        args.push(remote);
+        let out = self.raw(&args).await.map_err(|error| {
+            MikoError::sdk(format!(
+                "installation result unknown; check the device before retrying: {error}"
+            ))
+            .with_data(serde_json::json!({"outcome_unknown":true}))
+        })?;
+        let text = format!("{}\n{}", out.stdout, out.stderr);
+        if out.success() && text.contains("Success") {
+            return Ok(());
+        }
+        if let Some(failure) = parse_install_failure(&text) {
+            return Err(
+                MikoError::sdk(format!("install failed: {}", failure.reason))
+                    .with_data(serde_json::to_value(&failure).unwrap_or_default()),
+            );
+        }
+        Err(MikoError::sdk(format!(
+            "installation result unknown; check the device before retrying: {}",
+            text.trim()
+        ))
+        .with_data(serde_json::json!({"outcome_unknown":true})))
+    }
+
     pub async fn uninstall(&self, package: &str) -> MikoResult<()> {
         let out = self.run(&["uninstall", package]).await?;
         if out.stdout.contains("Success") {

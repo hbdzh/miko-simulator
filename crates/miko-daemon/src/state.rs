@@ -65,6 +65,7 @@ pub struct State {
     pub(crate) instances: Mutex<HashMap<Uuid, InstanceInfo>>,
     pub(crate) watchers: Mutex<HashMap<Uuid, JoinHandle<()>>>,
     pub(crate) locks: DeviceLocks,
+    pub(crate) input_ownership: Mutex<crate::input_ownership::InputOwnership>,
     /// Serialises image removal against device creation and SDK installation.
     pub(crate) image_gate: tokio::sync::RwLock<()>,
     // The registry owns providers. Weak references prevent a cycle through
@@ -96,6 +97,7 @@ pub struct State {
 struct Footprint {
     current: u64,
     peak: u64,
+    cpu_percent: Option<u32>,
 }
 
 impl std::fmt::Debug for State {
@@ -264,6 +266,7 @@ impl State {
         )?;
         let settings = load_settings(&config.paths.settings_file());
         let (events, _) = broadcast::channel(1024);
+        let input_dir = config.paths.data.join("input-owners");
         Ok(Arc::new_cyclic(|me| Self {
             paths: config.paths,
             storage_lease: OnceLock::new(),
@@ -275,6 +278,7 @@ impl State {
             instances: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
             locks: DeviceLocks::default(),
+            input_ownership: Mutex::new(crate::input_ownership::InputOwnership::new(input_dir)),
             image_gate: tokio::sync::RwLock::new(()),
             providers: OnceLock::new(),
             events,
@@ -346,6 +350,7 @@ impl State {
                 name: d.name.clone(),
                 expected_mb: self.expected_mb(d),
                 measured_mb: samples.get(&d.id).map(|f| f.current).filter(|m| *m > 0),
+                cpu_percent: samples.get(&d.id).and_then(|f| f.cpu_percent),
             })
             .collect();
         Ok(Budget::new(mem, self.settings().budget_percent, used))
@@ -572,13 +577,17 @@ impl State {
             .map(|(id, i)| (*id, i.clone()))
             .collect();
         for (id, info) in running {
-            let Some(mb) = self.backend.footprint_mb(&info).await else {
-                continue;
-            };
+            let (mb, cpu) = tokio::join!(
+                self.backend.footprint_mb(&info),
+                self.backend.cpu_percent(&info)
+            );
             let mut f = lock(&self.footprints);
             let e = f.entry(id).or_default();
-            e.current = mb;
-            e.peak = e.peak.max(mb);
+            e.cpu_percent = cpu;
+            if let Some(mb) = mb {
+                e.current = mb;
+                e.peak = e.peak.max(mb);
+            }
         }
     }
 
@@ -651,6 +660,9 @@ impl State {
         status: DeviceStatus,
         runtime: Option<Option<miko_core::DeviceRuntime>>,
     ) {
+        if matches!(status, DeviceStatus::Stopped | DeviceStatus::Crashed { .. }) {
+            lock(&self.input_ownership).device_stopped(id);
+        }
         let updated = self.with_store(|s| {
             s.set_runtime(id, |d| {
                 d.status = status;
@@ -772,6 +784,92 @@ impl State {
             tracing::warn!(device = %name, "flushing guest storage before stop failed: {e}");
         }
     }
+
+    pub(crate) async fn stop_device_cancellable(
+        &self,
+        id: Uuid,
+        cancel: Option<&Cancel>,
+    ) -> MikoResult<Device> {
+        if let Some(cancel) = cancel {
+            cancel.check()?;
+        }
+        let current = self.with_store(|s| s.get(id).cloned())?;
+        if matches!(current.status, DeviceStatus::Hibernated) {
+            // Already stopped, with its state saved for the next start.
+            return Ok(current);
+        }
+        let info = self.instance(id);
+        if let Some(info) = info {
+            if let Some(cancel) = cancel {
+                let flush = self.flush_guest_storage(&current.name, &info);
+                tokio::pin!(flush);
+                loop {
+                    tokio::select! {
+                        () = &mut flush => break,
+                        () = tokio::time::sleep(std::time::Duration::from_millis(50)) => cancel.check()?,
+                    }
+                }
+                cancel.check()?;
+            } else {
+                self.flush_guest_storage(&current.name, &info).await;
+            }
+            let resumed = lock(&self.resumed).contains(&id);
+            let quick_boot = current
+                .launch
+                .quick_boot
+                .unwrap_or(self.settings().quick_boot)
+                && current.pool_base.is_none();
+            let snapshot_failed =
+                quick_boot && self.save_stop_snapshot(&current, &info).await.is_err();
+            let cold_boot_persisted = !snapshot_failed || self.mark_failed_stop_snapshot(&current);
+            if let Some(cancel) = cancel
+                && cancel.is_cancelled()
+            {
+                if !cold_boot_persisted {
+                    return Err(MikoError::sdk(
+                        "quick-boot snapshot could not be saved or marked for cold boot",
+                    ));
+                }
+                return Err(miko_core::cancel::cancelled());
+            }
+            if let Some(w) = lock(&self.watchers).remove(&id) {
+                w.abort();
+            }
+            lock(&self.instances).remove(&id);
+            lock(&self.resumed).remove(&id);
+            self.set_status(id, DeviceStatus::Stopping, None);
+            let adopted = lock(&self.adopted).contains(&id);
+            let result = if adopted && quick_boot && !snapshot_failed {
+                self.backend.stop_without_save(&info).await
+            } else {
+                self.backend.stop(&info).await
+            };
+            if let Err(e) = result {
+                // Put it back: we don't know its state.
+                lock(&self.instances).insert(id, info.clone());
+                if resumed {
+                    lock(&self.resumed).insert(id);
+                }
+                self.set_status(id, DeviceStatus::Running, Some(Some(info.runtime())));
+                self.watch_crash(id, info);
+                return Err(e);
+            }
+            lock(&self.adopted).remove(&id);
+            if cold_boot_persisted {
+                self.clear_session_marker(&current);
+            }
+            if snapshot_failed {
+                self.emit(
+                    "device.snapshot_warning",
+                    json!({"device": id, "reason": "stop_save_failed", "cold_boot_persisted": cold_boot_persisted}),
+                );
+            }
+        }
+        self.finish_footprint(id);
+        crate::state::lock(&self.activity).remove(&id);
+        self.set_status(id, DeviceStatus::Stopped, Some(None));
+        self.with_store(|s| s.get(id).cloned())
+    }
 }
 
 #[async_trait]
@@ -819,60 +917,7 @@ impl DaemonContext for State {
     }
 
     async fn stop_device(&self, id: Uuid) -> MikoResult<Device> {
-        let current = self.with_store(|s| s.get(id).cloned())?;
-        if matches!(current.status, DeviceStatus::Hibernated) {
-            // Already stopped, with its state saved for the next start.
-            return Ok(current);
-        }
-        let info = self.instance(id);
-        if let Some(info) = info {
-            self.flush_guest_storage(&current.name, &info).await;
-            let resumed = lock(&self.resumed).contains(&id);
-            let quick_boot = current
-                .launch
-                .quick_boot
-                .unwrap_or(self.settings().quick_boot)
-                && current.pool_base.is_none();
-            let snapshot_failed =
-                quick_boot && self.save_stop_snapshot(&current, &info).await.is_err();
-            let cold_boot_persisted = !snapshot_failed || self.mark_failed_stop_snapshot(&current);
-            if let Some(w) = lock(&self.watchers).remove(&id) {
-                w.abort();
-            }
-            lock(&self.instances).remove(&id);
-            lock(&self.resumed).remove(&id);
-            self.set_status(id, DeviceStatus::Stopping, None);
-            let adopted = lock(&self.adopted).contains(&id);
-            let result = if adopted && quick_boot && !snapshot_failed {
-                self.backend.stop_without_save(&info).await
-            } else {
-                self.backend.stop(&info).await
-            };
-            if let Err(e) = result {
-                // Put it back: we don't know its state.
-                lock(&self.instances).insert(id, info.clone());
-                if resumed {
-                    lock(&self.resumed).insert(id);
-                }
-                self.set_status(id, DeviceStatus::Running, Some(Some(info.runtime())));
-                self.watch_crash(id, info);
-                return Err(e);
-            }
-            lock(&self.adopted).remove(&id);
-            if cold_boot_persisted {
-                self.clear_session_marker(&current);
-            }
-            if snapshot_failed {
-                self.emit(
-                    "device.snapshot_warning",
-                    json!({"device": id, "reason": "stop_save_failed", "cold_boot_persisted": cold_boot_persisted}),
-                );
-            }
-        }
-        self.finish_footprint(id);
-        crate::state::lock(&self.activity).remove(&id);
-        self.set_status(id, DeviceStatus::Stopped, Some(None));
-        self.with_store(|s| s.get(id).cloned())
+        self.stop_device_cancellable(id, None).await
     }
 
     async fn shut_down_device(&self, id: Uuid) -> MikoResult<Device> {

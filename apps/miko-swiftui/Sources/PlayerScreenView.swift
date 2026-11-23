@@ -16,9 +16,18 @@ final class ScreenView: NSView, NSTextInputClient {
     }
     private var rotation = 0
     private var mappedKeys: [UInt16: (id: Int, x: Double, y: Double)] = [:]
+    private var mappedActions: [UInt16: MappingAction] = [:]
+    private var mappingPhysicalKeys = Set<UInt16>()
+    private var repeatCycles: [UInt16: MappingRepeatCycle] = [:]
+    private var mappingTimers: [UInt16: DispatchWorkItem] = [:]
+    private var mappingTokens: [UInt16: UUID] = [:]
     private var activeJoysticks: [Int: (id: Int, x: Double, y: Double, held: Set<JoystickDirection>)] = [:]
     private var activeJoystickKeys: [UInt16: (index: Int, direction: JoystickDirection)] = [:]
     private var editingDrag: EditingDrag?
+    private var traceRecording: (target: MappingTraceTarget, started: TimeInterval, points: [MappingTracePoint])?
+    private var mouseAim: (key: UInt16, binding: MappingBinding, state: MappingAimState)?
+    private var consumedCancelKeys = Set<UInt16>()
+    private var priorMouseMovedEvents = false
     func present(_ frame: CGImage, rotation next: Int) {
         if rotation != next { releaseMappedKeys(); rotation = next; transport?.mapping.rotationChanged(to: next) }
         image = frame
@@ -62,15 +71,23 @@ final class ScreenView: NSView, NSTextInputClient {
     }
     override var isFlipped: Bool { true }
     override func viewDidMoveToWindow() {
+        if window == nil { releaseMouseAim() }
         super.viewDidMoveToWindow()
         if let windowObserver { NotificationCenter.default.removeObserver(windowObserver) }
         if let window {
-            windowObserver = NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) { [weak self] _ in self?.releaseHeldInputs() }
+            windowObserver = NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) { [weak self] _ in
+                guard let self else { return }
+                if self.transport?.scriptPlaybackActive == true { self.transport?.scriptPlayStop() }
+                self.releaseHeldInputs()
+            }
         } else {
             windowObserver = nil
         }
     }
-    deinit { if let windowObserver { NotificationCenter.default.removeObserver(windowObserver) } }
+    deinit {
+        releaseMouseAim()
+        if let windowObserver { NotificationCenter.default.removeObserver(windowObserver) }
+    }
 
     private var imageRect: NSRect {
         guard let image, image.width > 0, image.height > 0, bounds.width > 0, bounds.height > 0 else { return .zero }
@@ -249,7 +266,6 @@ final class ScreenView: NSView, NSTextInputClient {
         return rect.height > 0 ? Double(rect.width / rect.height) : 1.0
     }
     override func mouseDown(with event: NSEvent) {
-        guard !scriptPlaybackActive else { return }
         if syncFollowerLocked {
             transport?.showSyncLockedHint()
             return
@@ -257,6 +273,11 @@ final class ScreenView: NSView, NSTextInputClient {
         window?.makeFirstResponder(self)
         let point = convert(event.locationInWindow, from: nil)
         guard imageRect.contains(point) else { return }
+        if let mapping = transport?.mapping, mapping.editing, let target = mapping.traceTarget,
+           target.rotation == rotation, let (x, y) = clampedNormalizedPoint(point) {
+            traceRecording = (target, ProcessInfo.processInfo.systemUptime, [MappingTracePoint(x: x, y: y, tMs: 0)])
+            return
+        }
         if let mapping = transport?.mapping, mapping.editing {
             let lang = transport?.language ?? 1
             if let hit = bindingHit(at: point), mapping.select(key: hit.key, rotation: rotation) {
@@ -278,8 +299,9 @@ final class ScreenView: NSView, NSTextInputClient {
             }
             return
         }
-        gesture = PlayerGesture.from(option: event.modifierFlags.contains(.option),
-                                     shift: event.modifierFlags.contains(.shift))
+        if mouseAim?.binding.action != .fpsView { releaseMappedKeys() }
+        gesture = mouseAim?.binding.action == .fpsView ? .single : PlayerGesture.from(
+            option: event.modifierFlags.contains(.option), shift: event.modifierFlags.contains(.shift))
         dragging = true
         if gesture.needsSecondFinger, let second = secondFingerPoint(event) {
             secondFinger = second
@@ -289,6 +311,11 @@ final class ScreenView: NSView, NSTextInputClient {
         sendTouch(event, down: true)
     }
     override func mouseDragged(with event: NSEvent) {
+        if mouseAim != nil { mouseMoved(with: event); return }
+        if traceRecording != nil {
+            appendTracePoint(event, final: false)
+            return
+        }
         if let mapping = transport?.mapping, mapping.editing, let drag = editingDrag {
             let point = convert(event.locationInWindow, from: nil)
             switch drag {
@@ -319,6 +346,17 @@ final class ScreenView: NSView, NSTextInputClient {
         sendTouch(event, down: true)
     }
     override func mouseUp(with event: NSEvent) {
+        if traceRecording != nil {
+            appendTracePoint(event, final: true)
+            if let recording = traceRecording, let mapping = transport?.mapping, mapping.traceTarget == recording.target {
+                if !mapping.setTrace(key: recording.target.key, rotation: recording.target.rotation, points: recording.points) {
+                    transport?.onStatus?(t("轨迹无效，请重新录制。", "Invalid path. Record it again.", transport?.language ?? 1))
+                }
+                mapping.cancelTrace()
+            }
+            traceRecording = nil
+            return
+        }
         if let mapping = transport?.mapping, mapping.editing, editingDrag != nil {
             editingDrag = nil
             return
@@ -335,6 +373,7 @@ final class ScreenView: NSView, NSTextInputClient {
         gesture = .single
     }
     override func rightMouseDown(with event: NSEvent) {
+        if cancelMouseSkill() { return }
         guard let mapping = transport?.mapping, mapping.editing else {
             super.rightMouseDown(with: event)
             return
@@ -353,15 +392,76 @@ final class ScreenView: NSView, NSTextInputClient {
         }
     }
     private func releaseMappedKeys() {
-        for value in mappedKeys.values { transport?.send(["type": "mapped_touch", "id": value.id, "x": value.x, "y": value.y, "down": false]) }
-        mappedKeys.removeAll()
+        _ = cancelMouseSkill()
+        for key in Array(mappedKeys.keys) { stopMappedControl(key) }
+        mappingPhysicalKeys.removeAll()
         for state in activeJoysticks.values { transport?.send(["type": "mapped_touch", "id": state.id, "x": state.x, "y": state.y, "down": false]) }
         activeJoysticks.removeAll()
         activeJoystickKeys.removeAll()
+        releaseMouseAim()
     }
-    /// Playback owns input in the bridge. The view stops sending ordinary input
-    /// while a script plays; held state is dropped locally without sending
-    /// releases because the bridge already released it on playback start.
+
+    @discardableResult private func cancelMouseSkill() -> Bool {
+        guard let aim = mouseAim, aim.binding.action == .skillAim, let value = mappedKeys[aim.key] else { return false }
+        mappedKeys[aim.key] = (value.id, aim.binding.endX, aim.binding.endY)
+        transport?.send(["type": "mapped_touch", "id": value.id, "x": aim.binding.endX, "y": aim.binding.endY, "down": true])
+        stopMappedControl(aim.key)
+        return true
+    }
+
+    private func beginMouseAim(key: UInt16, binding: MappingBinding) -> Bool {
+        guard let window else { return false }
+        if let current = mouseAim, !cancelMouseSkill() { stopMappedControl(current.key) }
+        guard CGAssociateMouseAndMouseCursorPosition(0) == .success else {
+            transport?.onStatus?(t("无法捕获鼠标，请检查系统权限。", "Could not capture the mouse. Check system permissions.", transport?.language ?? 1))
+            return false
+        }
+        priorMouseMovedEvents = window.acceptsMouseMovedEvents
+        window.acceptsMouseMovedEvents = true
+        NSCursor.hide()
+        mouseAim = (key, binding, MappingAimState(binding: binding))
+        return true
+    }
+
+    private func releaseMouseAim() {
+        guard mouseAim != nil else { return }
+        mouseAim = nil
+        _ = CGAssociateMouseAndMouseCursorPosition(1)
+        NSCursor.unhide()
+        window?.acceptsMouseMovedEvents = priorMouseMovedEvents
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        guard var aim = mouseAim, !inputBlocked, let value = mappedKeys[aim.key] else { return }
+        let rect = imageRect
+        aim.state.move(dx: event.deltaX, dy: event.deltaY, width: rect.width, height: rect.height)
+        mappedKeys[aim.key] = (value.id, aim.state.x, aim.state.y)
+        transport?.send(["type": "mapped_touch", "id": value.id, "x": aim.state.x, "y": aim.state.y, "down": true])
+        if aim.binding.action == .fpsView && (aim.state.atLimit(width: rect.width, height: rect.height) || aim.state.x <= 0 || aim.state.x >= 1 || aim.state.y <= 0 || aim.state.y >= 1) {
+            transport?.send(["type": "mapped_touch", "id": value.id, "x": aim.state.x, "y": aim.state.y, "down": false])
+            aim.state = MappingAimState(binding: aim.binding)
+            mappedKeys[aim.key] = (value.id, aim.state.x, aim.state.y)
+            transport?.send(["type": "mapped_touch", "id": value.id, "x": aim.state.x, "y": aim.state.y, "down": true])
+        }
+        mouseAim = aim
+    }
+    private func appendTracePoint(_ event: NSEvent, final: Bool) {
+        guard var recording = traceRecording,
+              transport?.mapping.traceTarget == recording.target,
+              let (x, y) = clampedNormalizedPoint(convert(event.locationInWindow, from: nil)) else { return }
+        let elapsed = max(final ? 1 : 0, Int((ProcessInfo.processInfo.systemUptime - recording.started) * 1000))
+        guard elapsed <= 10000, recording.points.count < 1024 else {
+            traceRecording = nil
+            transport?.mapping.cancelTrace()
+            transport?.onStatus?(t("轨迹超过时间或采样上限，请录制较短的轨迹。", "Path exceeded the time or sample limit. Record a shorter path.", transport?.language ?? 1))
+            return
+        }
+        let point = MappingTracePoint(x: x, y: y, tMs: elapsed)
+        recording.points.append(point)
+        traceRecording = recording
+    }
+    /// The bridge releases old input on playback start. Drop the corresponding
+    /// local state so subsequent manual actions can take ownership cleanly.
     func setScriptPlaybackBlocked(_ blocked: Bool) {
         guard blocked != scriptPlaybackBlocked else { return }
         scriptPlaybackBlocked = blocked
@@ -380,7 +480,18 @@ final class ScreenView: NSView, NSTextInputClient {
     }
 
     private func clearHeldInputState() {
+        releaseMouseAim()
+        for (key, action) in mappedActions where action.holdsOwnershipBetweenTouches {
+            transport?.send(["type": "mapping_hold", "id": Int(key), "active": false])
+        }
+        for timer in mappingTimers.values { timer.cancel() }
+        mappingTimers.removeAll()
+        mappingTokens.removeAll()
         mappedKeys.removeAll()
+        mappedActions.removeAll()
+        mappingPhysicalKeys.removeAll()
+        consumedCancelKeys.removeAll()
+        repeatCycles.removeAll()
         activeJoysticks.removeAll()
         activeJoystickKeys.removeAll()
         editingDrag = nil
@@ -395,16 +506,18 @@ final class ScreenView: NSView, NSTextInputClient {
         needsDisplay = true
     }
 
-    private var scriptPlaybackActive: Bool {
-        scriptPlaybackBlocked || transport?.scriptPlaybackActive == true
-    }
-
     private var inputBlocked: Bool {
-        scriptPlaybackActive || syncFollowerLocked
+        syncFollowerLocked
     }
 
     fileprivate func releaseHeldInputs() {
+        consumedCancelKeys.removeAll()
+        traceRecording = nil
+        transport?.mapping.cancelTrace()
         releaseMappedKeys()
+        releaseManualInputs()
+    }
+    private func releaseManualInputs() {
         if secondFingerDown, let secondFinger { sendSecondFinger(secondFinger, down: false) }
         secondFingerDown = false
         secondFinger = nil
@@ -423,6 +536,7 @@ final class ScreenView: NSView, NSTextInputClient {
     }
     override func flagsChanged(with event: NSEvent) {
         guard !inputBlocked else { return }
+        if mouseAim?.binding.action != .fpsView { releaseMappedKeys() }
         for (flag, key) in [(NSEvent.ModifierFlags.shift, "Shift"), (.control, "Control"), (.option, "Alt")] {
             let down = event.modifierFlags.contains(flag)
             if down && !pressedModifiers.contains(key) {
@@ -433,12 +547,25 @@ final class ScreenView: NSView, NSTextInputClient {
             }
         }
     }
+    func handleSkillCancelKeyDown(_ event: NSEvent) -> Bool {
+        if consumedCancelKeys.contains(event.keyCode) { return true }
+        guard !syncFollowerLocked, transport?.mapping.editing == false, let aim = mouseAim,
+              aim.binding.action == .skillAim,
+              !event.modifierFlags.contains(.command), !event.modifierFlags.contains(.control),
+              !event.modifierFlags.contains(.option),
+              let key = MappingKey.normalizeCancel(keyCode: event.keyCode, charactersIgnoringModifiers: event.charactersIgnoringModifiers),
+              aim.binding.cancelsSkill(with: key) else { return false }
+        consumedCancelKeys.insert(event.keyCode)
+        _ = cancelMouseSkill()
+        return true
+    }
+
     override func keyDown(with event: NSEvent) {
-        guard !scriptPlaybackActive else { return }
         if syncFollowerLocked {
             transport?.showSyncLockedHint()
             return
         }
+        if handleSkillCancelKeyDown(event) { return }
         if let mapping = transport?.mapping, mapping.editing {
             let lang = transport?.language ?? 1
             if event.keyCode == 53 {
@@ -466,23 +593,58 @@ final class ScreenView: NSView, NSTextInputClient {
             }
         }
         if let mapping = transport?.mapping, !event.modifierFlags.contains(.command), !event.modifierFlags.contains(.control), !event.modifierFlags.contains(.option) {
-            if mappedKeys[event.keyCode] != nil || activeJoystickKeys[event.keyCode] != nil { return }
+            if mappingPhysicalKeys.contains(event.keyCode) || activeJoystickKeys[event.keyCode] != nil { return }
             if mapping.enabled,
                let key = MappingKey.normalize(keyCode: event.keyCode, charactersIgnoringModifiers: event.charactersIgnoringModifiers) {
                 if let binding = mapping.scheme.bindings.first(where: { $0.key == key && $0.rotation == rotation }) {
+                    if binding.action == .script {
+                        guard !event.isARepeat else { return }
+                        mappingPhysicalKeys.insert(event.keyCode)
+                        releaseHeldInputs()
+                        transport?.scriptPlayDefault(id: binding.scriptID)
+                        return
+                    }
+                    let decision = MappingPressDecision.decide(action: binding.action, active: mappedKeys[event.keyCode] != nil, physicalDown: mappingPhysicalKeys.contains(event.keyCode), isRepeat: event.isARepeat)
+                    guard decision != .ignore else { return }
+                    releaseManualInputs()
+                    if decision == .stop {
+                        mappingPhysicalKeys.insert(event.keyCode)
+                        stopMappedControl(event.keyCode)
+                        return
+                    }
                     guard let id = nextTouchID() else { return }
+                    if binding.action == .fpsView || binding.action == .skillAim {
+                        guard beginMouseAim(key: event.keyCode, binding: binding) else { return }
+                    }
+                    mappingPhysicalKeys.insert(event.keyCode)
                     mappedKeys[event.keyCode] = (id, binding.x, binding.y)
+                    mappedActions[event.keyCode] = binding.action
                     transport?.noteInput()
+                    if binding.action.holdsOwnershipBetweenTouches {
+                        transport?.send(["type": "mapping_hold", "id": Int(event.keyCode), "active": true])
+                    }
                     transport?.send(["type": "mapped_touch", "id": id, "x": binding.x, "y": binding.y, "down": true])
+                    if binding.action == .repeatHold || binding.action == .repeatToggle {
+                        repeatCycles[event.keyCode] = MappingRepeatCycle()
+                        let token = UUID()
+                        mappingTokens[event.keyCode] = token
+                        scheduleRepeat(event.keyCode, interval: binding.repeatIntervalMs, token: token)
+                    } else if binding.action == .swipe || binding.action == .gesture {
+                        let token = UUID()
+                        mappingTokens[event.keyCode] = token
+                        scheduleSwipe(event.keyCode, binding: binding, started: ProcessInfo.processInfo.systemUptime, token: token)
+                    }
                     return
                 }
                 for (index, joystick) in mapping.scheme.joysticks.enumerated() where joystick.rotation == rotation {
                     guard let direction = joystick.direction(for: key) else { continue }
+                    releaseManualInputs()
                     handleJoystickKeyDown(keyCode: event.keyCode, index: index, joystick: joystick, direction: direction)
                     return
                 }
             }
         }
+        if mouseAim?.binding.action != .fpsView { releaseMappedKeys() }
         if event.isARepeat && pressedKeys[event.keyCode] != nil { return }
         if event.modifierFlags.contains(.command), let key = event.charactersIgnoringModifiers?.lowercased() {
             switch key {
@@ -505,6 +667,54 @@ final class ScreenView: NSView, NSTextInputClient {
         }
         interpretKeyEvents([event])
         pendingKey = nil
+    }
+    private func scheduleRepeat(_ keyCode: UInt16, interval: Int, token: UUID) {
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, let value = self.mappedKeys[keyCode],
+                  self.mappingTokens[keyCode] == token,
+                  let action = self.mappedActions[keyCode], action == .repeatHold || action == .repeatToggle else { return }
+            guard var cycle = self.repeatCycles[keyCode] else { return }
+            let down = cycle.advance()
+            self.repeatCycles[keyCode] = cycle
+            self.transport?.send(["type": "mapped_touch", "id": value.id, "x": value.x, "y": value.y, "down": down])
+            self.scheduleRepeat(keyCode, interval: interval, token: token)
+        }
+        mappingTimers[keyCode] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(max(20, interval / 2)), execute: work)
+    }
+    private func scheduleSwipe(_ keyCode: UInt16, binding: MappingBinding, started: TimeInterval, token: UUID) {
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.mappingTokens[keyCode] == token, let current = self.mappedKeys[keyCode] else { return }
+            let elapsed = max(0, ProcessInfo.processInfo.systemUptime - started)
+            let point = MappingPathStep(binding: binding, elapsedMs: elapsed * 1000, previousX: current.x, previousY: current.y)
+            let x = point.x, y = point.y
+            self.mappedKeys[keyCode] = (current.id, x, y)
+            if point.sendMove {
+                self.transport?.send(["type": "mapped_touch", "id": current.id, "x": x, "y": y, "down": true])
+            }
+            if point.finished {
+                self.stopMappedControl(keyCode)
+            } else {
+                self.scheduleSwipe(keyCode, binding: binding, started: started, token: token)
+            }
+        }
+        mappingTimers[keyCode] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(16), execute: work)
+    }
+    private func stopMappedControl(_ keyCode: UInt16) {
+        if mouseAim?.key == keyCode { releaseMouseAim() }
+        mappingTimers.removeValue(forKey: keyCode)?.cancel()
+        mappingTokens.removeValue(forKey: keyCode)
+        let action = mappedActions.removeValue(forKey: keyCode)
+        var cycle = repeatCycles.removeValue(forKey: keyCode)
+        let wasDown = cycle?.stopNeedsUp() ?? false
+        guard let value = mappedKeys.removeValue(forKey: keyCode) else { return }
+        if action != .repeatHold && action != .repeatToggle || wasDown {
+            transport?.send(["type": "mapped_touch", "id": value.id, "x": value.x, "y": value.y, "down": false])
+        }
+        if action?.holdsOwnershipBetweenTouches == true {
+            transport?.send(["type": "mapping_hold", "id": Int(keyCode), "active": false])
+        }
     }
     private func handleJoystickKeyDown(keyCode: UInt16, index: Int, joystick: JoystickBinding, direction: JoystickDirection) {
         if var state = activeJoysticks[index] {
@@ -548,14 +758,16 @@ final class ScreenView: NSView, NSTextInputClient {
         return true
     }
     override func keyUp(with event: NSEvent) {
+        if consumedCancelKeys.remove(event.keyCode) != nil { return }
+        mappingPhysicalKeys.remove(event.keyCode)
         if inputBlocked {
             _ = mappedKeys.removeValue(forKey: event.keyCode)
             _ = activeJoystickKeys.removeValue(forKey: event.keyCode)
             _ = pressedKeys.removeValue(forKey: event.keyCode)
             return
         }
-        if let value = mappedKeys.removeValue(forKey: event.keyCode) {
-            transport?.send(["type": "mapped_touch", "id": value.id, "x": value.x, "y": value.y, "down": false])
+        if let action = mappedActions[event.keyCode] {
+            if action.stopsOnKeyUp { stopMappedControl(event.keyCode) }
             return
         }
         if handleJoystickKeyUp(keyCode: event.keyCode) { return }
@@ -612,6 +824,7 @@ struct PlayerView: NSViewRepresentable {
     func makeNSView(context: Context) -> ScreenView {
         let view = ScreenView()
         view.transport = transport
+        transport.onReleasePlayerInput = { [weak view] in view?.releaseHeldInputs() }
         transport.mapping.onChange = { [weak view, weak transport] in
             guard let view else { return }
             if let mapping = transport?.mapping, !mapping.enabled || mapping.editing { view.releaseHeldInputs() }

@@ -35,14 +35,24 @@
 //! # }
 //! ```
 
+mod actions;
+mod flow;
 mod model;
 mod recorder;
+mod selectors;
 mod store;
 mod validate;
 
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub use actions::{
+    Action, ActionSample, ContactSample, actions_from_script, delete_action, script_with_actions,
+    set_wait_before,
+};
+pub use flow::{
+    Flow, FlowAction, FlowHost, FlowLog, FlowNode, FlowReport, Locator, Point, run_flow,
+};
 pub use model::{
     DisplayInfo, Event, FORMAT, MAPPED_ID_MAX, MAPPED_ID_MIN, MAX_COUNT, MAX_DEVICE_CHARS,
     MAX_DISPLAY, MAX_EVENTS, MAX_INTERVAL_MS, MAX_KEY_BYTES, MAX_NAME_CHARS, MAX_SCRIPT_MS,
@@ -50,5 +60,6 @@ pub use model::{
     TimedEvent, VERSION,
 };
 pub use recorder::Recorder;
-pub use store::{MAX_SCRIPT_BYTES, ScriptStore};
+pub use selectors::{Image, find_template, find_template_cancellable, find_ui};
+pub use store::{ActionDocument, MAX_SCRIPT_BYTES, ScriptStore};
 pub use validate::validate;

@@ -40,16 +40,11 @@ impl DeviceIo {
         let (w, h) = parse_wm_size(&wm).ok_or_else(|| {
             MikoError::unexpected(format!("can't read the screen size from {wm:?}"))
         })?;
-        let input = self
-            .adb
-            .shell("dumpsys input | grep -m1 SurfaceOrientation")
-            .await
-            .unwrap_or_default();
-        let rotated = input
-            .split(':')
-            .nth(1)
-            .and_then(|o| o.trim().parse::<u32>().ok())
-            .is_some_and(|o| o % 2 == 1);
+        let display = self.adb.shell("dumpsys display").await?;
+        let rotated = display_orientation(&display)
+            .ok_or_else(|| MikoError::unexpected("cannot read display orientation"))?
+            % 2
+            == 1;
         Ok(if rotated { (h, w) } else { (w, h) })
     }
 
@@ -84,14 +79,23 @@ impl DeviceIo {
             .map(|_| ())
     }
 
-    pub async fn swipe(&self, from: (u32, u32), to: (u32, u32), ms: u32) -> MikoResult<()> {
-        self.adb
-            .shell(&format!(
-                "input swipe {} {} {} {} {ms}",
-                from.0, from.1, to.0, to.1
-            ))
-            .await
-            .map(|_| ())
+    pub async fn swipe(
+        &self,
+        from: (u32, u32),
+        to: (u32, u32),
+        ms: u32,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> MikoResult<()> {
+        swipe_events(from, to, ms, cancel, |action, point| async move {
+            self.adb
+                .shell(&format!(
+                    "input motionevent {action} {} {}",
+                    point.0, point.1
+                ))
+                .await
+                .map(|_| ())
+        })
+        .await
     }
 
     /// Types into the focused field with `input text`. (gRPC `sendKey` text
@@ -101,11 +105,7 @@ impl DeviceIo {
         if text.is_empty() {
             return Ok(());
         }
-        if !text.chars().all(|c| c.is_ascii() && !c.is_ascii_control()) {
-            return Err(MikoError::usage(
-                "type_text supports printable ASCII; paste other text with command_run clipboard commands",
-            ));
-        }
+        validate_input_text(text)?;
         self.adb.shell(&input_text_command(text)).await.map(|_| ())
     }
 
@@ -137,6 +137,70 @@ impl DeviceIo {
                 format!("uiautomator gave no hierarchy: {}", out.trim()),
             )),
         }
+    }
+}
+
+fn display_orientation(output: &str) -> Option<u32> {
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("mCurrentOrientation=")?
+            .parse::<u32>()
+            .ok()
+            .filter(|value| *value < 4)
+    })
+}
+
+async fn swipe_events<F, Fut>(
+    from: (u32, u32),
+    to: (u32, u32),
+    ms: u32,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+    mut send: F,
+) -> MikoResult<()>
+where
+    F: FnMut(&'static str, (u32, u32)) -> Fut,
+    Fut: std::future::Future<Output = MikoResult<()>>,
+{
+    if *cancel.borrow() {
+        return Ok(());
+    }
+    let mut point = from;
+    // A failed DOWN may still have reached Android, so always attempt UP.
+    let mut result = send("DOWN", point).await;
+    let started = tokio::time::Instant::now();
+    while result.is_ok() && !*cancel.borrow() {
+        if started.elapsed() >= Duration::from_millis(u64::from(ms)) {
+            break;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(16)) => {},
+            changed = cancel.changed() => { if changed.is_err() || *cancel.borrow() { break; } }
+        }
+        if *cancel.borrow() {
+            break;
+        }
+        let fraction = (started.elapsed().as_secs_f64() / (f64::from(ms) / 1000.0)).min(1.0);
+        point = (
+            (f64::from(from.0) + (f64::from(to.0) - f64::from(from.0)) * fraction).round() as u32,
+            (f64::from(from.1) + (f64::from(to.1) - f64::from(from.1)) * fraction).round() as u32,
+        );
+        result = send("MOVE", point).await;
+    }
+    if result.is_ok() && !*cancel.borrow() && point != to {
+        point = to;
+        result = send("MOVE", point).await;
+    }
+    let up = send("UP", point).await;
+    result.and(up)
+}
+
+pub fn validate_input_text(text: &str) -> MikoResult<()> {
+    if text.chars().all(|c| c.is_ascii() && !c.is_ascii_control()) {
+        Ok(())
+    } else {
+        Err(MikoError::usage(
+            "type_text supports printable ASCII; paste other text with command_run clipboard commands",
+        ))
     }
 }
 
@@ -191,6 +255,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reads_logical_display_orientation() {
+        assert_eq!(display_orientation("  mCurrentOrientation=1\n"), Some(1));
+        assert_eq!(display_orientation("mCurrentOrientation=4"), None);
+    }
+
+    #[tokio::test]
+    async fn cancelled_swipe_releases_before_returning_and_reports_failed_up() {
+        for fail_up in [false, true] {
+            let (cancel, receiver) = tokio::sync::watch::channel(false);
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = events.clone();
+            let result = swipe_events(
+                (10, 20),
+                (100, 200),
+                1000,
+                receiver,
+                move |action, point| {
+                    captured.lock().unwrap().push((action, point));
+                    if action == "DOWN" {
+                        cancel.send(true).unwrap();
+                    }
+                    async move {
+                        if action == "UP" && fail_up {
+                            Err(MikoError::unexpected("up failed"))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                },
+            )
+            .await;
+            assert_eq!(result.is_err(), fail_up);
+            assert_eq!(
+                *events.lock().unwrap(),
+                vec![("DOWN", (10, 20)), ("UP", (10, 20))]
+            );
+        }
+    }
+
+    #[test]
     fn input_text_is_shell_safe() {
         assert_eq!(input_text_command("battery"), "input text 'battery'");
         assert_eq!(input_text_command("hi there"), "input text 'hi%sthere'");
@@ -234,5 +338,20 @@ mod tests {
         );
         // Small screens aren't upscaled.
         assert_eq!(shot_scale(720, 1000), 1.0);
+    }
+
+    #[tokio::test]
+    async fn completed_swipe_reaches_requested_endpoint() {
+        let (_sender, receiver) = tokio::sync::watch::channel(false);
+        let events = std::sync::Mutex::new(Vec::new());
+        swipe_events((10, 20), (80, 90), 1, receiver, |action, point| {
+            events.lock().unwrap().push((action, point));
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        let events = events.into_inner().unwrap();
+        assert_eq!(events.last(), Some(&("UP", (80, 90))));
+        assert!(events.contains(&("MOVE", (80, 90))));
     }
 }

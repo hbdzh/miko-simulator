@@ -222,12 +222,12 @@ impl AvdManager {
     }
 
     pub fn exists(&self, name: &str) -> bool {
-        self.dir(name).join("config.ini").is_file()
+        self.dir(name).exists() || self.ini(name).exists()
     }
 
     fn require(&self, name: &str) -> MikoResult<PathBuf> {
         validate_name(name)?;
-        if self.exists(name) {
+        if self.dir(name).join("config.ini").is_file() {
             Ok(self.dir(name))
         } else {
             Err(MikoError::not_found(format!("AVD {name} does not exist")))
@@ -291,7 +291,9 @@ impl AvdManager {
             )));
         }
         let dir = self.dir(&spec.name);
-        std::fs::create_dir_all(&dir).ctx(ErrorCode::Sdk, format!("creating {}", dir.display()))?;
+        std::fs::create_dir_all(&self.home)
+            .ctx(ErrorCode::Sdk, format!("creating {}", self.home.display()))?;
+        std::fs::create_dir(&dir).ctx(ErrorCode::Sdk, format!("creating {}", dir.display()))?;
         Self::config_for(spec).write(&dir.join("config.ini"))?;
         self.write_pointer(&spec.name, spec.image.api)?;
         self.info(&spec.name)
@@ -411,6 +413,19 @@ impl AvdManager {
             return Err(MikoError::usage(format!("AVD {dst} already exists")));
         }
         let to = self.dir(dst);
+        // A normal copy may fall back to copying blocks rather than cloning
+        // them. Reserve enough for that case, plus 1 GiB of free space.
+        let needed = clone_disk_usage(&from, RUNTIME_ENTRIES, None)?.saturating_add(1 << 30);
+        crate::host::ensure_free_space(&to, needed)?;
+        std::fs::create_dir(&to).ctx(ErrorCode::Sdk, format!("reserving {}", to.display()))?;
+        if let Err(error) = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.ini(dst))
+        {
+            let _ = std::fs::remove_dir(&to);
+            return Err(MikoError::sdk(format!("reserving clone pointer: {error}")));
+        }
         let result = copy_tree(&from, &to, RUNTIME_ENTRIES).and_then(|()| {
             let mut c = ConfigIni::read(&to.join("config.ini"))?;
             c.set("AvdId", dst);
@@ -427,6 +442,68 @@ impl AvdManager {
         if result.is_err() {
             let _ = std::fs::remove_dir_all(&to);
             let _ = std::fs::remove_file(self.ini(dst));
+        }
+        result
+    }
+
+    /// Cancellable cold clone. The destination is reserved exclusively, and
+    /// a cancelled or failed copy removes only the files created by this call.
+    pub fn clone_avd_cancellable(
+        &self,
+        src: &str,
+        dst: &str,
+        display_name: &str,
+        cancel: &miko_core::Cancel,
+    ) -> MikoResult<AvdInfo> {
+        cancel.check()?;
+        let from = self.require(src)?;
+        validate_name(dst)?;
+        self.ensure_stopped(src)?;
+        let to = self.dir(dst);
+        let needed =
+            clone_disk_usage(&from, RUNTIME_ENTRIES, Some(cancel))?.saturating_add(1 << 30);
+        cancel.check()?;
+        crate::host::ensure_free_space(&to, needed)?;
+        std::fs::create_dir(&to).ctx(ErrorCode::Sdk, format!("reserving {}", to.display()))?;
+        let pointer = self.ini(dst);
+        if let Err(error) = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pointer)
+        {
+            let _ = std::fs::remove_dir(&to);
+            return Err(MikoError::sdk(format!(
+                "reserving {}: {error}",
+                pointer.display()
+            )));
+        }
+        let result = (|| {
+            copy_tree_cancellable(&from, &to, RUNTIME_ENTRIES, cancel)?;
+            cancel.check()?;
+            let mut c = ConfigIni::read(&to.join("config.ini"))?;
+            c.set("AvdId", dst);
+            c.set("avd.ini.displayname", display_name);
+            c.write(&to.join("config.ini"))?;
+            let api = c
+                .get("target")
+                .and_then(|t| t.strip_prefix("android-"))
+                .and_then(|a| a.parse().ok())
+                .unwrap_or(0);
+            cancel.check()?;
+            self.write_pointer(dst, api)?;
+            cancel.check()?;
+            self.info(dst)
+        })();
+        if result.is_err() {
+            let dir_result = std::fs::remove_dir_all(&to);
+            let pointer_result = std::fs::remove_file(&pointer);
+            if let Err(error) = dir_result.and(pointer_result) {
+                return Err(MikoError::sdk(format!(
+                    "clone cleanup failed for {}: {error}",
+                    to.display()
+                ))
+                .with_data(serde_json::json!({"cleanup_failed":true})));
+            }
         }
         result
     }
@@ -721,8 +798,40 @@ pub fn process_alive(pid: u32) -> bool {
         .unwrap_or(true)
 }
 
+fn clone_disk_usage(
+    from: &Path,
+    skip: &[&str],
+    cancel: Option<&miko_core::Cancel>,
+) -> MikoResult<u64> {
+    let mut total: u64 = 0;
+    for entry in
+        std::fs::read_dir(from).ctx(ErrorCode::Sdk, format!("reading {}", from.display()))?
+    {
+        if let Some(cancel) = cancel {
+            cancel.check()?;
+        }
+        let entry = entry.ctx(ErrorCode::Sdk, "reading directory entry")?;
+        let name = entry.file_name();
+        if skip.iter().any(|s| name == *s) || name.to_string_lossy().ends_with(".lock") {
+            continue;
+        }
+        let ty = entry.file_type().ctx(ErrorCode::Sdk, "reading file type")?;
+        let bytes = if ty.is_dir() {
+            clone_disk_usage(&entry.path(), &[], cancel)?
+        } else if ty.is_file() {
+            entry
+                .metadata()
+                .ctx(ErrorCode::Sdk, "reading file metadata")?
+                .len()
+        } else {
+            0
+        };
+        total = total.saturating_add(bytes);
+    }
+    Ok(total)
+}
+
 fn copy_tree(from: &Path, to: &Path, skip: &[&str]) -> MikoResult<()> {
-    std::fs::create_dir_all(to).ctx(ErrorCode::Sdk, format!("creating {}", to.display()))?;
     for e in std::fs::read_dir(from).ctx(ErrorCode::Sdk, format!("reading {}", from.display()))? {
         let e = e.ctx(ErrorCode::Sdk, "reading directory entry")?;
         let name = e.file_name();
@@ -732,6 +841,7 @@ fn copy_tree(from: &Path, to: &Path, skip: &[&str]) -> MikoResult<()> {
         let (src, dst) = (e.path(), to.join(&name));
         let ty = e.file_type().ctx(ErrorCode::Sdk, "reading file type")?;
         if ty.is_dir() {
+            std::fs::create_dir(&dst).ctx(ErrorCode::Sdk, format!("creating {}", dst.display()))?;
             copy_tree(&src, &dst, &[])?;
         } else if ty.is_file() {
             // On APFS, std::fs::copy uses clonefile: instant and space-free.
@@ -739,6 +849,93 @@ fn copy_tree(from: &Path, to: &Path, skip: &[&str]) -> MikoResult<()> {
         }
     }
     Ok(())
+}
+
+fn copy_tree_cancellable(
+    from: &Path,
+    to: &Path,
+    skip: &[&str],
+    cancel: &miko_core::Cancel,
+) -> MikoResult<()> {
+    use std::io::{Read, Write};
+    for entry in
+        std::fs::read_dir(from).ctx(ErrorCode::Sdk, format!("reading {}", from.display()))?
+    {
+        cancel.check()?;
+        let entry = entry.ctx(ErrorCode::Sdk, "reading directory entry")?;
+        let name = entry.file_name();
+        if skip.iter().any(|s| name == *s) || name.to_string_lossy().ends_with(".lock") {
+            continue;
+        }
+        let (src, dst) = (entry.path(), to.join(name));
+        let ty = entry.file_type().ctx(ErrorCode::Sdk, "reading file type")?;
+        if ty.is_dir() {
+            std::fs::create_dir(&dst).ctx(ErrorCode::Sdk, format!("creating {}", dst.display()))?;
+            copy_tree_cancellable(&src, &dst, &[], cancel)?;
+        } else if ty.is_file() {
+            // Try a copy-on-write clone first; a child process lets cancellation
+            // interrupt even a slow filesystem operation.
+            let mut cp = std::process::Command::new("cp");
+            if cfg!(target_os = "macos") {
+                cp.arg("-c");
+            } else if cfg!(target_os = "linux") {
+                cp.arg("--reflink=always");
+            }
+            let cloned = if cfg!(any(target_os = "macos", target_os = "linux")) {
+                let mut child = cp
+                    .arg(&src)
+                    .arg(&dst)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .ctx(ErrorCode::Sdk, "starting clone copy")?;
+                loop {
+                    if cancel.is_cancelled() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return cancel.check();
+                    }
+                    if let Some(status) = child
+                        .try_wait()
+                        .ctx(ErrorCode::Sdk, "waiting for clone copy")?
+                    {
+                        break status.success();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            } else {
+                false
+            };
+            if !cloned {
+                let mut input = std::fs::File::open(&src)
+                    .ctx(ErrorCode::Sdk, format!("opening {}", src.display()))?;
+                let mut output = std::fs::File::create(&dst)
+                    .ctx(ErrorCode::Sdk, format!("creating {}", dst.display()))?;
+                output
+                    .set_permissions(
+                        input
+                            .metadata()
+                            .ctx(ErrorCode::Sdk, "reading file permissions")?
+                            .permissions(),
+                    )
+                    .ctx(ErrorCode::Sdk, "setting copied file permissions")?;
+                let mut buffer = vec![0u8; 1024 * 1024];
+                loop {
+                    cancel.check()?;
+                    let count = input
+                        .read(&mut buffer)
+                        .ctx(ErrorCode::Sdk, format!("reading {}", src.display()))?;
+                    if count == 0 {
+                        break;
+                    }
+                    output
+                        .write_all(&buffer[..count])
+                        .ctx(ErrorCode::Sdk, format!("writing {}", dst.display()))?;
+                }
+            }
+        }
+    }
+    cancel.check()
 }
 
 pub fn disk_usage(path: &Path) -> u64 {
@@ -769,6 +966,22 @@ fn allocated(meta: &std::fs::Metadata) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clone_space_estimate_ignores_runtime_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("userdata.img"), vec![1; 8192]).unwrap();
+        std::fs::create_dir(root.path().join("snapshots")).unwrap();
+        std::fs::write(root.path().join("snapshots/ram.bin"), vec![2; 16384]).unwrap();
+        let expected = std::fs::metadata(root.path().join("userdata.img"))
+            .unwrap()
+            .len();
+        assert_eq!(
+            clone_disk_usage(root.path(), RUNTIME_ENTRIES, None).unwrap(),
+            expected
+        );
+        assert!(clone_disk_usage(&root.path().join("missing"), &[], None).is_err());
+    }
 
     const STUDIO_STYLE: &str = "\
 AvdId = Pixel_5_API_31
@@ -1124,5 +1337,50 @@ other.src.avd.like = /h/avd/src.avd.bak/x
             );
         }
         validate_name("Pixel_6.1-fhd").unwrap();
+    }
+    #[test]
+    fn cancelled_clone_removes_partial_destination_and_preserves_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = AvdManager::new(temp.path());
+        let source = manager.dir("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(
+            source.join("config.ini"),
+            "target=android-35\nAvdId=source\n",
+        )
+        .unwrap();
+        for index in 0..100 {
+            std::fs::write(source.join(format!("data-{index}")), b"source data").unwrap();
+        }
+        let cancel = miko_core::Cancel::new();
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            manager.clone_avd_cancellable("source", "copy", "Copy", &worker_cancel)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let copied = || {
+            std::fs::read_dir(temp.path().join("copy.avd"))
+                .ok()
+                .is_some_and(|mut entries| {
+                    entries.any(|entry| {
+                        entry.is_ok_and(|entry| {
+                            entry.file_name().to_string_lossy().starts_with("data-")
+                        })
+                    })
+                })
+        };
+        while !copied() && !worker.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(copied(), "file copy did not start");
+        cancel.cancel();
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(miko_core::cancel::is_cancelled(&error), "{error}");
+        assert!(!temp.path().join("copy.avd").exists());
+        assert!(!temp.path().join("copy.ini").exists());
+        assert_eq!(
+            std::fs::read(source.join("data-0")).unwrap(),
+            b"source data"
+        );
     }
 }

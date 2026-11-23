@@ -98,7 +98,7 @@ impl SerialInput for Handler {
             .unwrap();
     }
     async fn release(&mut self) {
-        self.state.release().await;
+        self.state.release().await.unwrap();
     }
 }
 fn handler(wire: Wire) -> Handler {
@@ -390,7 +390,7 @@ async fn failed_down_reply_is_released_and_chord_failure_keeps_user_modifier() {
             .await
             .is_err()
     );
-    state.release().await;
+    state.release().await.unwrap();
     assert_eq!(inputs(&trace).len(), 2);
     assert!(state.held.is_empty());
     state
@@ -419,7 +419,7 @@ async fn failed_down_reply_is_released_and_chord_failure_keeps_user_modifier() {
     );
     assert_eq!(state.held.len(), 1);
     assert!(matches!(&state.held[0],Held::Key{key,..} if key=="Shift"));
-    state.release().await;
+    state.release().await.unwrap();
     assert!(state.held.is_empty());
 }
 
@@ -474,10 +474,44 @@ async fn release_is_bounded_when_remote_never_answers() {
         )
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), state.release())
-        .await
-        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), state.release())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(state.held.len(), 1, "an unconfirmed release remains held");
+}
+
+#[tokio::test]
+async fn failed_release_is_reported_and_can_be_retried() {
+    let mut wire = Wire::new();
+    wire.fail_at = Some(3);
+    let trace = Arc::clone(&wire.trace);
+    let mut state = InputState::new(wire);
+    for key in ["a", "b"] {
+        state
+            .command(
+                Command::Key {
+                    key: key.into(),
+                    down: true,
+                },
+                (720, 1280),
+                &AtomicU32::new(0),
+            )
+            .await
+            .unwrap();
+    }
+    assert!(state.release().await.is_err());
+    assert_eq!(state.held.len(), 1);
+    assert_eq!(
+        inputs(&trace).len(),
+        4,
+        "other releases are still attempted"
+    );
+    state.release().await.unwrap();
     assert!(state.held.is_empty());
+    assert_eq!(inputs(&trace).len(), 5);
 }
 
 #[test]

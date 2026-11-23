@@ -28,6 +28,48 @@ pub const MAX_LINE: usize = 4 * 1024 * 1024;
 /// macOS limits Unix socket paths to 104 bytes.
 const MAX_SOCKET_PATH: usize = 100;
 
+struct InputGuard {
+    state: Arc<crate::state::State>,
+    device: uuid::Uuid,
+    connection: u64,
+    token: uuid::Uuid,
+    released: bool,
+    release_on_success: bool,
+}
+impl InputGuard {
+    fn complete(&mut self) -> MikoResult<()> {
+        if self.release_on_success {
+            crate::state::lock(&self.state.input_ownership).release(
+                self.device,
+                self.connection,
+                self.token,
+            )?;
+        }
+        self.released = true;
+        Ok(())
+    }
+}
+impl Drop for InputGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            crate::state::lock(&self.state.input_ownership).abandon(
+                self.device,
+                self.connection,
+                self.token,
+            );
+        }
+    }
+}
+
+fn input_failed_before_injection(error: &MikoError) -> bool {
+    matches!(error.code, ErrorCode::Usage | ErrorCode::NotFound)
+        && error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("grpc_code"))
+            .is_none()
+}
+
 /// Binds the daemon socket (mode 0600), replacing a stale one. Fails with
 /// `busy` if another daemon is listening.
 pub fn bind(path: &Path) -> MikoResult<UnixListener> {
@@ -345,6 +387,16 @@ impl Daemon {
             );
         };
         let (provider, spec) = (provider.clone(), spec.clone());
+        let flow_start = (method == "flow.run").then(|| {
+            (
+                params
+                    .pointer("/flow/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                std::time::Instant::now(),
+            )
+        });
         // Any command naming a device is activity on it (auto-hibernate).
         if let Some(sel) = params.get("device").and_then(Value::as_str)
             && let Ok(d) = self.state.device(sel).await
@@ -353,6 +405,46 @@ impl Daemon {
         }
         let result: MikoResult<Value> = async {
             crate::validate::validate(&spec.params, &params)?;
+            let mut input_guard = if method == "key.press"
+                || method == "input.gamepad.connect"
+                || method == "flow.run"
+            {
+                let selector = params
+                    .get("device")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| MikoError::usage("missing input device"))?;
+                let device = self.state.device(selector).await?;
+                let mut ownership = crate::state::lock(&self.state.input_ownership);
+                if let Some(raw) = params.get("input_lease").and_then(Value::as_str) {
+                    let token = uuid::Uuid::parse_str(raw)
+                        .map_err(|_| MikoError::usage("invalid input token"))?;
+                    if !ownership.owns(device.id, conn, token) {
+                        return Err(MikoError::busy("input ownership changed"));
+                    }
+                    Some(InputGuard {
+                        state: self.state.clone(),
+                        device: device.id,
+                        connection: conn,
+                        token,
+                        released: false,
+                        release_on_success: false,
+                    })
+                } else {
+                    // A direct key press is handed off only after its paired
+                    // key-up; long-running input jobs cooperate with cancel.
+                    let token = ownership.acquire(device.id, conn, true)?;
+                    Some(InputGuard {
+                        state: self.state.clone(),
+                        device: device.id,
+                        connection: conn,
+                        token,
+                        released: false,
+                        release_on_success: true,
+                    })
+                }
+            } else {
+                None
+            };
             let (guard, device) = if spec.locks_device {
                 let selector = params
                     .get("device")
@@ -364,18 +456,43 @@ impl Daemon {
                     .locks
                     .try_lock(device.id, &device.name, &method, None)?;
                 (Some(guard), Some(device.id))
+            } else if method == "flow.run" {
+                (None, input_guard.as_ref().map(|guard| guard.device))
             } else {
                 (None, None)
             };
             let daemon: Arc<dyn DaemonContext> = self.state.clone();
             if !spec.long_running {
-                return provider
+                let result = provider
                     .call(&CallCtx::new(daemon).on_connection(conn), &method, params)
                     .await;
+                if (result.is_ok() || result.as_ref().is_err_and(input_failed_before_injection))
+                    && let Some(guard) = input_guard.as_mut()
+                {
+                    guard.complete()?;
+                }
+                return result;
             }
             // Long-running: answer now with the job; the lock moves into it.
+            if let Some(guard) = input_guard.as_ref() {
+                crate::state::lock(&guard.state.input_ownership).pin_job(
+                    guard.device,
+                    guard.connection,
+                    guard.token,
+                )?;
+            }
             let (job, cancel) = self.jobs.create(&method, device);
-            if let Some(d) = device {
+            if matches!(method.as_str(), "flow.run" | "input.gamepad.connect")
+                && let Some(guard) = input_guard.as_ref()
+            {
+                crate::state::lock(&self.state.input_ownership).set_job_cancel(
+                    guard.device,
+                    guard.connection,
+                    guard.token,
+                    cancel.clone(),
+                )?;
+            }
+            if let Some(d) = device.filter(|_| spec.locks_device) {
                 self.state.locks.set_job(d, job);
             }
             let (jobs, events) = (self.jobs.clone(), daemon.clone());
@@ -413,14 +530,52 @@ impl Daemon {
             );
             tokio::spawn(async move {
                 let _guard = guard;
-                crate::jobs::run_job(jobs, daemon, job, provider.call(&ctx, &method, params)).await;
+                let result = provider.call(&ctx, &method, params).await;
+                let result = match (result, input_guard.as_mut()) {
+                    (Ok(value), Some(guard)) => guard.complete().map(|()| value),
+                    (Err(error), Some(guard))
+                        if if matches!(method.as_str(), "flow.run" | "input.gamepad.connect") {
+                            error
+                                .data
+                                .as_ref()
+                                .and_then(|data| data.get("input_released"))
+                                .and_then(Value::as_bool)
+                                == Some(true)
+                                || (method == "input.gamepad.connect"
+                                    && input_failed_before_injection(&error))
+                        } else {
+                            input_failed_before_injection(&error)
+                        } =>
+                    {
+                        guard.complete().and(Err(error))
+                    }
+                    (result, _) => result,
+                };
+                crate::jobs::run_job(jobs, daemon, job, async { result }).await;
             });
             Ok(json!({ "job": job, "pending": true }))
         }
         .await;
         match result {
             Ok(v) => Response::ok(id, v),
-            Err(e) => Response::err(id, RpcError::from_miko(&e)),
+            Err(mut e) => {
+                if let Some((name, started)) = flow_start {
+                    let dir = self
+                        .state
+                        .paths
+                        .logs
+                        .join("flows")
+                        .join(uuid::Uuid::new_v4().to_string());
+                    crate::flow::log_start_failure(
+                        &dir,
+                        &name,
+                        started.elapsed().as_millis() as u64,
+                        &mut e,
+                    )
+                    .await;
+                }
+                Response::err(id, RpcError::from_miko(&e))
+            }
         }
     }
 
@@ -509,6 +664,17 @@ pub struct LogcatFollowParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grpc_input_errors_are_never_treated_as_pre_injection_validation() {
+        assert!(input_failed_before_injection(&MikoError::usage("bad key")));
+        assert!(input_failed_before_injection(&MikoError::not_found(
+            "device stopped"
+        )));
+        let failure = MikoError::new(ErrorCode::NotFound, "release failed")
+            .with_data(json!({"grpc_code":"NotFound"}));
+        assert!(!input_failed_before_injection(&failure));
+    }
 
     #[test]
     fn borrowed_event_encoding_preserves_notification_bytes() {

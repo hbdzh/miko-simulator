@@ -36,6 +36,9 @@ pub struct DeviceUse {
     /// What it uses right now, when the daemon has measured it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub measured_mb: Option<u64>,
+    /// Latest sampled host CPU percentage, where 100% is one logical core.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_percent: Option<u32>,
 }
 
 impl DeviceUse {
@@ -123,6 +126,7 @@ mod tests {
             name: name.into(),
             expected_mb,
             measured_mb,
+            cpu_percent: None,
         }
     }
 

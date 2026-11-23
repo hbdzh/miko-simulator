@@ -37,6 +37,8 @@ final class CenterModel: ObservableObject {
     private let appListLoader = AppListLoader<AppList>()
     @Published var notice = ""
     @Published var busy = Set<String>()
+    let batchOperations = BatchDeviceOperations()
+    let deviceGroups = DeviceGroups()
     private let lifecycle = CenterDeviceLifecycle()
     @Published var recording = Set<String>()
     @Published private var bootProgress: [String:Double] = [:]
@@ -261,6 +263,7 @@ final class CenterModel: ObservableObject {
         call("center.paths") { [weak self] result in
             if case .success(let value) = result, let paths = value as? [String:Any] {
                 self?.dataDirectory = paths["data"] as? String
+                if let data = paths["data"] as? String { self?.deviceGroups.load(dataDirectory: data) }
             }
         }
         refresh()
@@ -430,7 +433,7 @@ final class CenterModel: ObservableObject {
         guard bridge.isRunning, bridge.canWrite, let data = try? JSONSerialization.data(withJSONObject:["id":id,"method":method,"params":params]) else {
             done(.failure(CenterMessageError(message: text("后台未连接", "The background service is not connected")))); return
         }
-        let readOnly = ["host.budget", "device.list", "device.details", "app.list", "app.inspect", "image.list", "image.inventory", "profile.list", "snapshot.list", "sdk.status", "sdk.license_details", "settings.get", "cache.list", "center.about", "center.paths", "center.prefs.get", "center.quit", "center.storage.estimate", "battery.get", "gps.get", "network.get", "network.proxy.get", "network.shaping.get", "identity.get", "file.sync.list", "input.gamepad.list", "input.gamepad.get", "sensor.get", "logcat.dump", "root.cacert.list", "device.props.get", "dev.get", "clipboard.get", "jobs.list", "jobs.get", "daemon.status"]
+        let readOnly = ["host.budget", "device.list", "device.details", "app.list", "app.inspect", "image.list", "image.inventory", "profile.list", "snapshot.list", "sdk.status", "sdk.license_details", "settings.get", "cache.list", "center.about", "center.paths", "center.prefs.get", "center.quit", "center.storage.estimate", "battery.get", "gps.get", "network.get", "network.proxy.get", "network.shaping.get", "identity.get", "file.sync.list", "input.gamepad.list", "input.gamepad.get", "sensor.get", "logcat.dump", "root.cacert.list", "device.props.get", "dev.get", "clipboard.get", "jobs.list", "jobs.get", "daemon.status", "flow.status", "flow.validate"]
         requests.register(id: id, method: method, device: params["device"] as? String,
                           mutation: !readOnly.contains(method), progress: onProgress, completion: done)
         if method == "device.details" || method == "host.budget" || readTimeout != nil {
@@ -547,7 +550,7 @@ final class CenterModel: ObservableObject {
             if let method, !localMethods.contains(method) { bridgeAnswered() }
             if !migratingStorage, ConnectionHealth.looksDisconnected(message) { connectionLost() }
         } else {
-            if let device = requestDevice, method == "file.install" || method == "app.uninstall" {
+            if let device = requestDevice, method == "file.install" || method == "file.install_task" || method == "app.uninstall" {
                 appSearch.invalidate(device)
             }
             completion(.success(event["result"] ?? NSNull()))
@@ -1230,15 +1233,19 @@ final class CenterModel: ObservableObject {
             }
         })
     }
-    func operation(_ method:String, id:String, params:[String:Any] = [:], then: (() -> Void)? = nil) {
-        guard !busy.contains(id) else { return }
-        if method == "device.stop" { failedStopSnapshots.removeValue(forKey: id); lifecycle.beginStop(id) }
+    func operation(_ method:String, id:String, params:[String:Any] = [:], batchProgress: BatchDeviceOperations.Progress? = nil, batchCompletion: BatchDeviceOperations.Completion? = nil, then: (() -> Void)? = nil) {
+        guard !busy.contains(id) else {
+            batchCompletion?(.failure(CenterMessageError(message: text("设备正忙", "Device is busy")))); return
+        }
+        let stopping = method == "device.stop" || method == "device.stop_task"
+        if stopping { failedStopSnapshots.removeValue(forKey: id); lifecycle.beginStop(id) }
         busy.insert(id); var args = params; args["device"] = id
-        call(method,args,onProgress:{ [weak self] _, job, _ in
+        call(method,args,onProgress:{ [weak self] message, job, fraction in
             if let job { self?.ownJobs.insert(job) }
+            batchProgress?(message, job, fraction)
         }) { [weak self] result in
             guard let self else { return }
-            if method == "device.stop" { self.lifecycle.finishStop(id) }
+            if stopping { self.lifecycle.finishStop(id) }
             if method == "device.delete", case .success = result {
                 self.verifyDeletion(id, then: then)
                 return
@@ -1247,25 +1254,31 @@ final class CenterModel: ObservableObject {
             let stopPending = self.lifecycle.pendingWindowStops.contains(id)
             switch result {
             case .success:
-                if method == "device.stop", stopPending {
+                if stopping, stopPending {
                     self.lifecycle.finishWindowStop(id)
                     self.finishClosingPlayer(id)
                 }
-                if method == "device.stop", let warning = self.failedStopSnapshots.removeValue(forKey: id) {
-                    self.showError(warning)
-                } else {
+                let stopWarning = stopping ? self.failedStopSnapshots.removeValue(forKey: id) : nil
+                if let warning = stopWarning {
+                    if batchCompletion == nil { self.showError(warning) }
+                } else if batchCompletion == nil {
                     self.showToast(self.text("操作完成", "Completed"))
                 }
                 self.refresh(); self.refreshJobs()
                 if self.selected == id { self.load(id) }
                 if !stopPending { then?() }
+                if let warning = stopWarning { batchCompletion?(.failure(CenterMessageError(message: warning))) }
+                else { batchCompletion?(.success(())) }
             case .failure(let error):
-                if method == "device.stop", stopPending {
+                if stopping, stopPending {
                     self.lifecycle.finishWindowStop(id)
                     self.players[id]?.transport.stoppingDevice = false
                 }
                 let message = error.localizedDescription
-                if method == "file.install", message.contains("INSTALL_FAILED_INSUFFICIENT_STORAGE") {
+                if batchCompletion != nil {
+                    let reason = (error as? CenterMessageError)?.isQuickBootSaveFailure == true ? self.quickBootFailureMessage(error) : self.readable(error)
+                    batchCompletion?(.failure(CenterMessageError(message: reason)))
+                } else if method == "file.install", message.contains("INSTALL_FAILED_INSUFFICIENT_STORAGE") {
                     self.showError(self.text("安装失败：设备空间不足。可释放空间，或新建更大容量的设备。", "Installation failed: the device is out of storage. Free some space or create a larger device."))
                 } else if method == "file.install", let apk = args["apk"] as? String, Self.isSignatureMismatch(message) {
                     self.promptReinstall(device:id, apkPath:apk)
@@ -1394,6 +1407,7 @@ final class CenterModel: ObservableObject {
                     : (launch ?? self.playerLaunchState(for: details.device))
                 self.windowRegistry.setInitialLaunchState(launchState, for: id)
                 let player = GameWindowController()
+                player.transport.setBackgroundFrameMode(.saved)
                 player.chrome.scriptAction = { [weak self] action, completion in
                     self?.performScriptAction(action, completion: completion)
                 }
@@ -1608,6 +1622,32 @@ final class CenterModel: ObservableObject {
         if let thumbnail = context.makeImage() { deviceThumbnails[id] = thumbnail }
     }
     var hasPlayers: Bool { !players.isEmpty }
+
+    func arrangePlayerWindows() {
+        var displays: [ObjectIdentifier: (NSScreen, [(GameWindowController, NSWindow, DeviceWindowLayoutSpec)])] = [:]
+        var skipped = 0
+        for (_, controller) in players.sorted(by: { $0.key < $1.key }) {
+            guard let window = controller.window, let spec = controller.gridLayoutSpec(),
+                  let screen = window.screen ?? centerWindow?.screen ?? NSScreen.main else { skipped += 1; continue }
+            let key = ObjectIdentifier(screen)
+            if displays[key] == nil { displays[key] = (screen, []) }
+            displays[key]?.1.append((controller, window, spec))
+        }
+        for (_, (screen, entries)) in displays {
+            guard let frames = DeviceWindowLayout.frames(specs: entries.map { $0.2 }, visible: screen.visibleFrame) else {
+                skipped += entries.count; continue
+            }
+            for (entry, frame) in zip(entries, frames) {
+                if entry.1.isMiniaturized { entry.1.deminiaturize(nil) }
+                entry.1.setFrame(frame, display: true)
+            }
+        }
+        if skipped > 0 {
+            showError(text("有 \(skipped) 个窗口无法排列：请退出全屏或减少该屏幕上的窗口。", "Could not arrange \(skipped) windows. Exit full screen or reduce the number on that display."))
+        } else if !players.isEmpty {
+            showToast(text("窗口已排列", "Windows arranged"))
+        }
+    }
     var hasActiveRecording: Bool { players.values.contains { $0.transport.recording != .idle } }
     func closePlayers() {
         for (id, player) in Array(players) {
@@ -1637,6 +1677,39 @@ final class CenterModel: ObservableObject {
               !busy.contains(id), busyHolder(for: id) == nil, closePlayerForStop(id) else { return }
         operation("device.hibernate", id: id)
     }
+    func beginBatch(_ action: BatchDeviceOperation, ids: Set<String>) {
+        let targets = devices.filter { ids.contains($0.id) }.map { ($0.id, $0.name) }
+        var cloneNames = Set(devices.map { $0.name.lowercased() })
+        batchOperations.begin(action, devices: targets, execute: { [weak self] action, id, progress, completion in
+            guard let self else { completion(.failure(CenterMessageError(message: "Center closed"))); return }
+            guard let device = self.devices.first(where: { $0.id == id }) else {
+                completion(.failure(CenterMessageError(message: self.text("找不到设备", "Device not found")))); return
+            }
+            switch action {
+            case .start:
+                guard device.stopped || device.running else { completion(.failure(CenterMessageError(message: self.text("设备状态不允许启动", "Device cannot be started in its current state")))); return }
+                self.start(id, batchProgress: progress, batchCompletion: completion)
+            case .stop:
+                if device.stopped { completion(.success(())); return }
+                guard !self.busy.contains(id), self.closePlayerForStop(id) else {
+                    completion(.failure(CenterMessageError(message: self.text("设备正忙或播放器未能关闭", "Device is busy or its player could not close")))); return
+                }
+                self.operation("device.stop_task", id: id, batchProgress: progress, batchCompletion: completion)
+            case .install(let path):
+                guard device.running else { completion(.failure(CenterMessageError(message: self.text("设备未运行", "Device is not running")))); return }
+                self.operation("file.install_task", id: id, params: ["apk": path, "replace": true], batchProgress: progress, batchCompletion: completion)
+            case .clone:
+                guard device.stopped else { completion(.failure(CenterMessageError(message: self.text("请先停止设备", "Stop the device before cloning")))); return }
+                cloneNames.formUnion(self.devices.map { $0.name.lowercased() })
+                let name = BatchCloneNaming.next(source: device.name, reserved: &cloneNames)
+                self.operation("device.clone_task", id: id, params: ["name": name], batchProgress: progress, batchCompletion: completion)
+            }
+        }, cancelJob: { [weak self] job in
+            self?.call("jobs.cancel", ["job": job]) { [weak self] result in
+                if case .failure(let error) = result { self?.showError(self?.readable(error) ?? error.localizedDescription) }
+            }
+        })
+    }
     private func stopAfterWindowClose(_ id: String) {
         guard lifecycle.requestWindowStop(id) else { return }
         players[id]?.transport.stoppingDevice = true
@@ -1663,10 +1736,10 @@ final class CenterModel: ObservableObject {
         operation("device.stop", id: id)
         return true
     }
-    func start(_ id:String, coldBoot:Bool = false) {
-        guard let device = devices.first(where: { $0.id == id }) else { return }
-        guard !busy.contains(id) else { return }
-        if device.running { openGame(id); return }
+    func start(_ id:String, coldBoot:Bool = false, batchProgress: BatchDeviceOperations.Progress? = nil, batchCompletion: BatchDeviceOperations.Completion? = nil) {
+        guard let device = devices.first(where: { $0.id == id }) else { batchCompletion?(.failure(CenterMessageError(message: text("找不到设备", "Device not found")))); return }
+        guard !busy.contains(id) else { batchCompletion?(.failure(CenterMessageError(message: text("设备正忙", "Device is busy")))); return }
+        if device.running { if batchCompletion == nil { openGame(id) }; batchCompletion?(.success(())); return }
         busy.insert(id)
         lifecycle.beginStart(id)
         let booting = PlayerLaunchState.booting(progress: bootProgressFraction(for: id),
@@ -1685,6 +1758,7 @@ final class CenterModel: ObservableObject {
                 self.lifecycle.recordStartJob(job, for: id)
                 self.cancelStartingDeviceIfPossible(id)
             }
+            batchProgress?(message, job, fraction)
             let text = message.isEmpty ? self.text("正在启动设备…", "Starting the device…")
                                        : OperationMessages.progress(message, language: self.language)
             if !self.lifecycle.pendingWindowStops.contains(id) {
@@ -1701,7 +1775,7 @@ final class CenterModel: ObservableObject {
                     self.applyLaunchState(.running, to: id)
                     if let warning = self.pendingSnapshotWarnings.removeValue(forKey: id) {
                         self.showError(warning)
-                    } else {
+                    } else if batchCompletion == nil {
                         self.showToast(self.text("设备已启动。", "Device started."))
                     }
                 }
@@ -1715,16 +1789,20 @@ final class CenterModel: ObservableObject {
                     reason = self.readable(error)
                 }
                 if !stopPending { self.applyLaunchState(.stopped(reason: reason), to: id) }
-                if !(stopPending && error.localizedDescription == "cancelled") { self.showError(reason) }
+                if batchCompletion == nil && !(stopPending && error.localizedDescription == "cancelled") { self.showError(reason) }
             }
             self.refresh(); self.refreshJobs()
             if self.selected == id { self.load(id) }
             self.drainWindowStop(id)
+            switch result {
+            case .success: batchCompletion?(.success(()))
+            case .failure(let error): batchCompletion?(.failure(CenterMessageError(message: self.readable(error))))
+            }
         }
     }
     func restart(_ id:String) {
         guard closePlayerForStop(id) else { return }
-        operation("device.stop",id:id) { [weak self] in self?.start(id) }
+        operation("device.stop", id: id, then: { [weak self] in self?.start(id) })
     }
     private func reportSyncDisplayIfNeeded(id: String, frameWidth: Int, frameHeight: Int, lcdWidth: Int, lcdHeight: Int) {
         guard let session = syncHub.session,

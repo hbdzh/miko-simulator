@@ -113,3 +113,45 @@ async fn clone_without_a_snapshot_still_cold_boots() {
     assert_eq!(names, ["Src", "Plain"]);
     h.stop().await;
 }
+
+#[tokio::test]
+async fn cancellable_clone_is_a_job_and_leaves_no_partial_device() {
+    let h = Harness::start().await;
+    let mut c = h.client().await;
+    c.ok("device.create", json!({"name":"Src","image":"35"}))
+        .await;
+    let source = c.ok("device.details", json!({"device":"Src"})).await["avd_dir"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for i in 0..100 {
+        std::fs::write(
+            std::path::Path::new(&source).join(format!("test-{i}")),
+            b"data",
+        )
+        .unwrap();
+    }
+    let task = c
+        .ok("device.clone_task", json!({"device":"Src","name":"Copy"}))
+        .await;
+    c.ok("jobs.cancel", json!({"job":task["job"]})).await;
+    let result = c
+        .ok("jobs.wait", json!({"job":task["job"],"timeout_s":10}))
+        .await;
+    assert_eq!(result["state"], "cancelled", "{result}");
+    let devices = c.ok("device.list", json!({})).await;
+    assert_eq!(devices.as_array().unwrap().len(), 1);
+    assert!(std::path::Path::new(&source).join("test-0").exists());
+    assert!(
+        !std::path::Path::new(&source)
+            .parent()
+            .unwrap()
+            .join("Copy.avd")
+            .exists()
+    );
+    let clone = c
+        .run("device.clone_task", json!({"device":"Src","name":"Copy"}))
+        .await;
+    assert_eq!(clone["name"], "Copy");
+    h.stop().await;
+}

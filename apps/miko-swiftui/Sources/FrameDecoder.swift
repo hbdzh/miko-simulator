@@ -1,6 +1,34 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import Foundation
 
+enum BackgroundFrameMode: String {
+    case realTime = "realTime"
+    case saveResources = "saveResources"
+
+    static let defaultsKey = "miko.player.backgroundFrameMode"
+    static var saved: Self {
+        Self(rawValue: UserDefaults.standard.string(forKey: defaultsKey) ?? "") ?? .saveResources
+    }
+}
+
+/// The stream is always drained; only frame allocation and presentation are gated.
+struct PlayerFramePolicy {
+    var mode: BackgroundFrameMode = .saveResources { didSet { nextFrame = 0 } }
+    var visible = true { didSet { if oldValue != visible { nextFrame = 0 } } }
+    var foreground = true { didSet { if oldValue != foreground { nextFrame = 0 } } }
+    private var nextFrame: TimeInterval = 0
+
+    var canPresent: Bool { mode == .realTime || visible }
+
+    mutating func shouldDecode(at time: TimeInterval) -> Bool {
+        guard canPresent else { return false }
+        guard mode == .saveResources && !foreground else { return true }
+        guard time >= nextFrame else { return false }
+        nextFrame = time + 0.2
+        return true
+    }
+}
+
 struct DecodedFrame {
     let width: Int
     let height: Int

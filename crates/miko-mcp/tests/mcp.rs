@@ -73,6 +73,44 @@ async fn tools_are_listed_with_annotations() {
 }
 
 #[tokio::test]
+async fn typed_input_is_rejected_while_another_client_owns_the_device() {
+    let (_tmp, daemon, player, mcp) = setup(McpOptions::default()).await;
+    player
+        .call("device.create", json!({"name":"P","image":"35"}))
+        .await
+        .unwrap();
+    player
+        .run("device.start", json!({"device":"P"}), |_| {})
+        .await
+        .unwrap();
+    let lease = player
+        .call("input.acquire", json!({"device":"P"}))
+        .await
+        .unwrap();
+    let error = mcp
+        .err("tap", json!({"device":"P","x":10,"y":20,"coords":"device"}))
+        .await;
+    assert_eq!(error["code"], "busy");
+    player
+        .call(
+            "input.release",
+            json!({"device":"P","token":lease["token"]}),
+        )
+        .await
+        .unwrap();
+    // The fake device cannot service an input, but ownership is available.
+    let next = player
+        .call("input.acquire", json!({"device":"P"}))
+        .await
+        .unwrap();
+    player
+        .call("input.release", json!({"device":"P","token":next["token"]}))
+        .await
+        .unwrap();
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn generic_commands_and_jobs() {
     let (_t, d, _h, mcp) = setup(McpOptions::default()).await;
     let physical = mcp
@@ -155,6 +193,8 @@ async fn generic_commands_and_jobs() {
     assert!(e["message"].as_str().unwrap().contains("command_list"));
     for blocked in [
         "daemon.shutdown",
+        "input.acquire",
+        "input.release",
         "events.subscribe",
         "logcat.follow",
         "hello",

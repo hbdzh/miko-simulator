@@ -200,7 +200,11 @@ impl DeviceStore {
             )));
         }
         self.devices.push(device);
-        self.save()
+        if let Err(error) = self.save() {
+            self.devices.pop();
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Updates a device in memory and on disk.
@@ -358,6 +362,19 @@ mod tests {
         store.devices.clear();
         store.save().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"[]");
+    }
+
+    #[test]
+    fn failed_insert_does_not_leave_device_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("not-a-directory");
+        std::fs::write(&blocked, b"file").unwrap();
+        let mut store = DeviceStore {
+            path: blocked.join("devices.json"),
+            devices: Vec::new(),
+        };
+        assert!(store.insert(device("failed")).is_err());
+        assert!(store.all().is_empty());
     }
 
     #[test]

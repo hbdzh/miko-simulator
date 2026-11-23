@@ -55,11 +55,17 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
     @Published private(set) var scriptPlaybackLoop = 0
     @Published private(set) var scriptPlaybackTotal = 0
     @Published private(set) var scriptPlaybackName: String?
+    @Published private(set) var scriptPlaybackID: String?
+    @Published private(set) var scriptPlaybackAction: Int?
     @Published private(set) var scriptPlaybackMode: PlaybackMode = .count
     @Published private(set) var scriptRecordingStartedAt: Date?
     @Published private(set) var scriptRecordedEvents = 0
     @Published private(set) var scriptRecordFinishing = false
     @Published private(set) var scriptError: String?
+    @Published private(set) var scriptEditorID: String?
+    @Published private(set) var scriptEditorRevision: String?
+    @Published private(set) var scriptEditorName = ""
+    @Published private(set) var scriptActions: [PlayerScriptActionRow] = []
     var scriptPlaybackActive: Bool { scriptPlayback != .idle }
 
     // MARK: Multi-device input synchronizer (D45)
@@ -82,6 +88,7 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
     let mapping = KeyMappingStore()
 
     var onFrame: ((CGImage, Int) -> Void)?
+    var onReleasePlayerInput: (() -> Void)?
     private(set) var lastFrame: CGImage?
     var onStatus: ((String) -> Void)?
     var onFrameSize: ((Int, Int) -> Void)?
@@ -133,7 +140,7 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
     // thread; the frame reader queue reads it before creating any CGImage. A
     // dedicated lock keeps that read cheap and independent from `frameLock`.
     private let visibilityLock = NSLock()
-    private var _displayVisible = true
+    private var framePolicy = PlayerFramePolicy()
 
     /// Whether decoded frames should currently be turned into CGImages and
     /// handed to the window. Frames are always parsed so the bridge never
@@ -141,7 +148,7 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
     var displayVisible: Bool {
         visibilityLock.lock()
         defer { visibilityLock.unlock() }
-        return _displayVisible
+        return framePolicy.canPresent
     }
 
     /// Called on the main thread from the player window's occlusion/order
@@ -149,13 +156,39 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
     /// only show a frame decoded after it became visible again.
     func setDisplayVisible(_ visible: Bool) {
         visibilityLock.lock()
-        let changed = _displayVisible != visible
-        _displayVisible = visible
+        let wasPresenting = framePolicy.canPresent
+        framePolicy.visible = visible
+        let changed = wasPresenting && !framePolicy.canPresent
         visibilityLock.unlock()
-        guard changed, !visible else { return }
+        guard changed else { return }
         frameLock.lock()
         pendingFrame = nil
         frameLock.unlock()
+    }
+
+    func setDisplayForeground(_ foreground: Bool) {
+        visibilityLock.lock()
+        framePolicy.foreground = foreground
+        visibilityLock.unlock()
+    }
+
+    func setBackgroundFrameMode(_ mode: BackgroundFrameMode) {
+        visibilityLock.lock()
+        let wasPresenting = framePolicy.canPresent
+        framePolicy.mode = mode
+        let changed = wasPresenting && !framePolicy.canPresent
+        visibilityLock.unlock()
+        if changed {
+            frameLock.lock()
+            pendingFrame = nil
+            frameLock.unlock()
+        }
+    }
+
+    private func shouldDecodeFrame() -> Bool {
+        visibilityLock.lock()
+        defer { visibilityLock.unlock() }
+        return framePolicy.shouldDecode(at: ProcessInfo.processInfo.systemUptime)
     }
 
     /// Records how to reach this device without opening a stream, so a window
@@ -236,6 +269,7 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
         input = nil
         frames = nil
         diagnostics = nil
+        onReleasePlayerInput?()
         connectionEnded = true
         linkState = PlayerExitClassifier.classify(diagnostic: lastDiagnostic)
         let scriptInterrupted = scriptRecording != .idle || scriptPlayback != .idle
@@ -264,6 +298,8 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
         scriptPlaybackLoop = 0
         scriptPlaybackTotal = 0
         scriptPlaybackName = nil
+        scriptPlaybackID = nil
+        scriptPlaybackAction = nil
     }
 
     /// The recording job belongs to the daemon. Losing its reporting stream
@@ -389,6 +425,9 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
     }
 
     func send(_ message: [String: Any]) {
+        if let type = message["type"] as? String, PlayerInputOwnership.releasesBeforeToolbarAction(type) {
+            onReleasePlayerInput?()
+        }
         guard JSONSerialization.isValidJSONObject(message),
               let data = try? JSONSerialization.data(withJSONObject: message) else { return }
         inputQueue.async { [weak self] in
@@ -546,6 +585,40 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
 
     func scriptList() { send(["type": "script_list"]) }
 
+    func scriptActionsGet(id: String) {
+        scriptEditorID = nil
+        scriptEditorRevision = nil
+        scriptActions = []
+        clearScriptError()
+        send(["type": "script_actions_get", "id": id])
+    }
+
+    func scriptActionDelete(id: String, index: Int) {
+        guard scriptEditorID == id, let revision = scriptEditorRevision else { return }
+        send(["type": "script_action_delete", "id": id, "revision": revision, "index": index])
+    }
+
+    func scriptActionWait(id: String, index: Int, milliseconds: Int) {
+        guard scriptEditorID == id, let revision = scriptEditorRevision,
+              milliseconds >= 0, milliseconds <= 86_400_000 else { return }
+        send(["type": "script_action_wait", "id": id, "revision": revision, "index": index, "wait_ms": milliseconds])
+    }
+
+    func scriptActionMove(id: String, from: Int, to: Int) {
+        guard scriptEditorID == id, let revision = scriptEditorRevision else { return }
+        send(["type": "script_action_move", "id": id, "revision": revision, "from": from, "to": to])
+    }
+
+    func scriptActionGesture(id: String, index: Int, x: Double, y: Double, endX: Double, endY: Double, duration: Int) {
+        guard scriptEditorID == id, let revision = scriptEditorRevision else { return }
+        send(["type": "script_action_gesture", "id": id, "revision": revision, "index": index, "x": x, "y": y, "end_x": endX, "end_y": endY, "duration_ms": duration])
+    }
+
+    func scriptActionCall(id: String, fragment: String) {
+        guard scriptEditorID == id, let revision = scriptEditorRevision else { return }
+        send(["type": "script_action_call", "id": id, "revision": revision, "script": fragment])
+    }
+
     func scriptDelete(id: String) { send(["type": "script_delete", "id": id]) }
 
     func scriptRename(id: String, name: String) {
@@ -562,8 +635,15 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
 
     func scriptPlayStart(id: String, options: PlaybackOptions) {
         clearScriptError()
+        onReleasePlayerInput?()
         scriptPlaybackMode = options.mode
         send(["type": "script_play_start", "id": id, "options": options.jsonObject])
+    }
+
+    func scriptPlayDefault(id: String) {
+        clearScriptError()
+        onReleasePlayerInput?()
+        send(["type": "script_play_start", "id": id])
     }
 
     func scriptPlayPause() { send(["type": "script_play_pause"]) }
@@ -576,6 +656,7 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
 
     @discardableResult
     func stop() -> Bool {
+        onReleasePlayerInput?()
         // Closing the window exits the bridge; send the script stop first so
         // the recorder/player can release held inputs cleanly.
         if scriptRecording != .idle { sendBestEffort(["type": "script_record_cancel"]) }
@@ -606,7 +687,7 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
         decoderLock.lock()
         defer { decoderLock.unlock() }
         let valid = autoreleasepool {
-            decoder.consume(data, shouldDecode: { displayVisible }) { frame in
+            decoder.consume(data, shouldDecode: { shouldDecodeFrame() }) { frame in
                 // Visibility may have changed while a frame was being read.
                 // The stream keeps flowing even when presentation is skipped.
                 guard displayVisible else {
@@ -690,6 +771,16 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
                     }
                     self.pasteboard.clearContents()
                     self.pasteboard.setString(text, forType: .string)
+                }
+            }
+        } else if line.hasPrefix("MIKO_FOREGROUND:") {
+            let payload = String(line.dropFirst("MIKO_FOREGROUND:".count))
+            if let data = payload.data(using: .utf8),
+               let result = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               let package = result["package"] as? String {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.generation == token else { return }
+                    self.mapping.updateForeground(package) { self.onReleasePlayerInput?() }
                 }
             }
         } else if line.hasPrefix("MIKO_MAPPING_PATH:") {
@@ -797,6 +888,19 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
                 }
                 self.onStatus?(readable)
             }
+        } else if line.hasPrefix("MIKO_INPUT:") {
+            let payload = String(line.dropFirst("MIKO_INPUT:".count))
+            guard let data = payload.data(using: .utf8),
+                  let result = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  result["state"] as? String == "failed" else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.generation == token else { return }
+                self.onReleasePlayerInput?()
+                let message = t("输入失败，已停止发送并尝试释放触点：", "Input failed; sending stopped and release was attempted: ", self.language) + (result["message"] as? String ?? "")
+                if self.syncRole != .off { self.onSyncBusy?(message) }
+                self.onStatus?(message)
+                self.send(["type": "input_reset"])
+            }
         } else if line.hasPrefix("MIKO_SCRIPT:") {
             let payload = String(line.dropFirst("MIKO_SCRIPT:".count))
             guard let data = payload.data(using: .utf8),
@@ -900,7 +1004,22 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
         case "list":
             scripts = (value["scripts"] as? [Any])?.compactMap { PlayerScriptSummary.decode($0) } ?? []
             scripts.sort { $0.created_at > $1.created_at }
+        case "actions":
+            guard let id = value["id"] as? String,
+                  let revision = value["revision"] as? String,
+                  let raw = value["actions"],
+                  let data = try? JSONSerialization.data(withJSONObject: raw),
+                  let actions = try? JSONDecoder().decode([PlayerScriptActionRow].self, from: data) else { return }
+            scriptEditorID = id
+            scriptEditorRevision = revision
+            scriptEditorName = value["name"] as? String ?? ""
+            scriptActions = actions
         case "play":
+            if let id = value["id"] as? String {
+                if scriptPlaybackID != id || (value["state"] as? String == "playing" && value["action_index"] is NSNull) { scriptPlaybackAction = nil }
+                scriptPlaybackID = id
+            }
+            if let index = value["action_index"] as? Int { scriptPlaybackAction = index }
             if let loop = value["loop"] as? Int { scriptPlaybackLoop = loop }
             scriptPlaybackTotal = value["count"] as? Int ?? 0
             if value["duration_ms"] != nil {
@@ -920,6 +1039,7 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
             case "finished", "stopped":
                 scriptPlayback = .idle
                 scriptPlaybackLoop = 0
+                scriptPlaybackAction = nil
                 onStatus?((value["state"] as? String) == "finished"
                           ? t("回放已完成", "Playback finished", language)
                           : t("回放已停止", "Playback stopped", language))
@@ -929,6 +1049,9 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
                 scriptError = PlayerScriptText.error(code: value["code"] as? String,
                                                     message: value["message"] as? String,
                                                     language: language)
+                if let index = scriptPlaybackAction {
+                    scriptError = t("动作 \(index + 1) 失败：", "Action \(index + 1) failed: ", language) + (scriptError ?? "")
+                }
                 onStatus?(scriptError ?? "")
             default:
                 break

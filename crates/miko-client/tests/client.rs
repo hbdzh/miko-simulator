@@ -108,6 +108,138 @@ async fn events_arrive_on_the_subscription() {
 }
 
 #[tokio::test]
+async fn wait_closed_observes_daemon_disconnect_even_when_already_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let daemon = TestDaemon::start(tmp.path()).await.unwrap();
+    let client = Client::connect(&daemon.paths.socket(), "test")
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), client.wait_closed())
+            .await
+            .is_err()
+    );
+    daemon.stop().await;
+    tokio::time::timeout(Duration::from_secs(5), client.wait_closed())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), client.wait_closed())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn manual_takeover_waits_for_previous_owner_release() {
+    let tmp = tempfile::tempdir().unwrap();
+    let daemon = TestDaemon::start(tmp.path()).await.unwrap();
+    let owner = Client::connect(&daemon.paths.socket(), "mcp-input")
+        .await
+        .unwrap();
+    let manual = std::sync::Arc::new(
+        Client::connect(&daemon.paths.socket(), "player")
+            .await
+            .unwrap(),
+    );
+    let other = Client::connect(&daemon.paths.socket(), "other")
+        .await
+        .unwrap();
+    owner
+        .call("device.create", json!({"name":"P","image":"35"}))
+        .await
+        .unwrap();
+    let mut events = owner.subscribe(&["input.revoke"]).await.unwrap();
+    let lease = owner
+        .call("input.acquire", json!({"device":"P","preemptible":true}))
+        .await
+        .unwrap();
+    let task = {
+        let manual = manual.clone();
+        tokio::spawn(async move {
+            manual
+                .call("input.acquire", json!({"device":"P","takeover":true}))
+                .await
+        })
+    };
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.data["token"], lease["token"]);
+    assert_eq!(
+        other
+            .call("input.acquire", json!({"device":"P"}))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Busy
+    );
+    assert!(
+        !task.is_finished(),
+        "takeover must wait for confirmed release"
+    );
+    owner
+        .call(
+            "input.release",
+            json!({"device":"P","token":lease["token"]}),
+        )
+        .await
+        .unwrap();
+    let next = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    manual
+        .call("input.release", json!({"device":"P","token":next["token"]}))
+        .await
+        .unwrap();
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn takeover_is_not_granted_if_previous_owner_disconnects_without_release() {
+    let tmp = tempfile::tempdir().unwrap();
+    let daemon = TestDaemon::start(tmp.path()).await.unwrap();
+    let owner = Client::connect(&daemon.paths.socket(), "mcp-input")
+        .await
+        .unwrap();
+    let manual = std::sync::Arc::new(
+        Client::connect(&daemon.paths.socket(), "player")
+            .await
+            .unwrap(),
+    );
+    owner
+        .call("device.create", json!({"name":"P","image":"35"}))
+        .await
+        .unwrap();
+    let mut events = owner.subscribe(&["input.revoke"]).await.unwrap();
+    owner
+        .call("input.acquire", json!({"device":"P","preemptible":true}))
+        .await
+        .unwrap();
+    let task = {
+        let manual = manual.clone();
+        tokio::spawn(async move {
+            manual
+                .call("input.acquire", json!({"device":"P","takeover":true}))
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(owner);
+    let error = tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Busy);
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn stale_daemon_is_detected_and_can_be_stopped() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = MikoPaths::under(tmp.path().join("j"));

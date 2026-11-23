@@ -713,7 +713,10 @@ async fn main() -> Result<()> {
                 }
                 return;
             }
-            let report_start = request.method == "device.start";
+            let report_start = matches!(
+                request.method.as_str(),
+                "device.start" | "device.stop_task" | "file.install_task" | "device.clone_task"
+            );
             let result = client.run_with_started(&request.method, request.params, |job| {
                 if report_start {
                     send(json!({"id":id,"type":"progress","job":job,"message":"","progress":null}));

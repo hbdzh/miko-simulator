@@ -48,4 +48,19 @@ resetDecoder.reset()
 var afterReset: [DecodedFrame] = []
 precondition(resetDecoder.consume(two) { afterReset.append($0) })
 precondition(afterReset.count == 1 && afterReset[0].pixels == Data([9,10,11,12]))
+var policy = PlayerFramePolicy()
+policy.foreground = false
+precondition(policy.shouldDecode(at: 10))
+precondition(!policy.shouldDecode(at: 10.1))
+precondition(policy.shouldDecode(at: 10.2))
+policy.visible = false
+precondition(!policy.shouldDecode(at: 11))
+policy.mode = .realTime
+precondition(policy.shouldDecode(at: 11) && policy.shouldDecode(at: 11.01))
+policy.mode = .saveResources
+policy.visible = true
+precondition(policy.shouldDecode(at: 12))
+precondition(!policy.shouldDecode(at: 12.1))
+policy.foreground = true
+precondition(policy.shouldDecode(at: 12.11) && policy.shouldDecode(at: 12.12))
 print("FrameDecoder tests passed")

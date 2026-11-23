@@ -10,6 +10,7 @@ use miko_automation::Event;
 use miko_sync::{Adaptation, DisplaySize, SeqCheck, SeqTracker, SyncOptions, forward};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashSet;
 
 use crate::Command;
 use crate::script::{event_from_command, is_direct_input};
@@ -26,6 +27,131 @@ pub enum SyncRole {
     Off,
     Leader,
     Follower,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum InputId {
+    Touch,
+    Mapped(i32),
+    Key(String),
+}
+
+fn held_event(event: &Event) -> Option<(InputId, bool)> {
+    match event {
+        Event::Touch { down, .. } => Some((InputId::Touch, *down)),
+        Event::MappedTouch { id, down, .. } => Some((InputId::Mapped(*id), *down)),
+        Event::Key { key, down } => Some((InputId::Key(key.clone()), *down)),
+        _ => None,
+    }
+}
+
+/// A remote gesture rejected before its first input must be dropped through
+/// its final release, otherwise a later move could begin a partial gesture.
+#[derive(Debug, Default)]
+pub(crate) struct RejectedRemote {
+    held: HashSet<InputId>,
+}
+impl RejectedRemote {
+    pub fn reject(&mut self, event: &Event) {
+        if let Some((id, true)) = held_event(event) {
+            self.held.insert(id);
+        }
+    }
+    pub fn should_skip(&mut self, event: &Event) -> bool {
+        if self.held.is_empty() {
+            return false;
+        }
+        if let Some((id, down)) = held_event(event) {
+            if down {
+                self.held.insert(id);
+            } else {
+                self.held.remove(&id);
+            }
+        }
+        true
+    }
+    pub fn clear(&mut self) {
+        self.held.clear();
+    }
+}
+
+/// Serial input owner for an unlocked follower. Once local input interrupts a
+/// forwarded gesture, the rest of that remote gesture is discarded through its
+/// last release; an incoming move must never recreate a released touch.
+#[derive(Debug, Default)]
+pub(crate) struct FollowerInputArbiter {
+    local: HashSet<InputId>,
+    remote: HashSet<InputId>,
+    remote_owned: bool,
+    suppress_remote: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LocalDecision {
+    pub accept: bool,
+    pub release_remote: bool,
+}
+
+impl FollowerInputArbiter {
+    pub fn local(&mut self, command: &Command) -> LocalDecision {
+        let event = event_from_command(command);
+        let held = event.as_ref().and_then(held_event);
+        if let Some((id, false)) = &held
+            && !self.local.contains(id)
+        {
+            return LocalDecision {
+                accept: false,
+                release_remote: false,
+            };
+        }
+        let release_remote = self.remote_owned && crate::script::is_manual_takeover(command);
+        if release_remote {
+            self.remote_owned = false;
+            self.suppress_remote = !self.remote.is_empty();
+        }
+        if let Some((id, down)) = held {
+            if down {
+                self.local.insert(id);
+            } else {
+                self.local.remove(&id);
+            }
+        }
+        LocalDecision {
+            accept: true,
+            release_remote,
+        }
+    }
+
+    pub fn remote(&mut self, event: &Event) -> bool {
+        if let Some((id, down)) = held_event(event) {
+            if down {
+                self.remote.insert(id);
+            } else {
+                self.remote.remove(&id);
+            }
+        }
+        if !self.local.is_empty() {
+            self.suppress_remote = !self.remote.is_empty();
+            return false;
+        }
+        if self.suppress_remote {
+            if self.remote.is_empty() {
+                self.suppress_remote = false;
+            }
+            return false;
+        }
+        self.remote_owned = !self.remote.is_empty();
+        true
+    }
+
+    /// A leader release must not release an independently held local input.
+    pub fn remote_release(&mut self) -> bool {
+        let release = self.remote_owned;
+        self.remote.clear();
+        self.remote_owned = false;
+        self.suppress_remote = false;
+        release
+    }
 }
 
 #[derive(Debug)]
@@ -69,10 +195,19 @@ impl BridgeSync {
         self.role == SyncRole::Follower && self.lock
     }
 
+    pub fn is_unlocked_follower(&self) -> bool {
+        self.role == SyncRole::Follower && !self.lock
+    }
+
     /// True when direct UI input must be ignored because this bridge is a
     /// locked follower.
     pub fn ignores_user_input(&self, command: &Command) -> bool {
-        self.is_locked_follower() && is_direct_input(command)
+        self.is_locked_follower()
+            && (is_direct_input(command)
+                || matches!(
+                    command,
+                    Command::ToolKey { .. } | Command::MappingHold { active: true, .. }
+                ))
     }
 
     /// Applies a `sync_mode` command. Returns `true` if held inputs should be
@@ -89,10 +224,13 @@ impl BridgeSync {
         sync_text: bool,
         sync_tool_keys: bool,
     ) -> bool {
-        let was_active = self.role != SyncRole::Off;
         let role_changed = self.role != role;
         let leader_changed =
             role == SyncRole::Follower && leader.is_some() && self.leader != leader;
+        let lock_changed = role == SyncRole::Follower && lock != self.lock;
+        let keyboard_filter_changed = role == SyncRole::Follower
+            && self.role == SyncRole::Follower
+            && self.options.sync_keyboard != sync_keyboard;
         self.role = role;
         self.lock = lock;
         self.leader = if role == SyncRole::Off { None } else { leader };
@@ -111,7 +249,7 @@ impl BridgeSync {
         if role_changed || leader_changed {
             self.seq_tracker = SeqTracker::new();
         }
-        was_active && (role == SyncRole::Off || role_changed || leader_changed)
+        role_changed || leader_changed || lock_changed || keyboard_filter_changed
     }
 
     /// Formats a `MIKO_SYNC:...` stderr line if this bridge is the leader and
@@ -222,6 +360,160 @@ mod tests {
 
     use super::*;
 
+    fn touch(down: bool) -> Event {
+        Event::Touch {
+            x: 0.5,
+            y: 0.5,
+            down,
+        }
+    }
+    fn local_touch(down: bool) -> Command {
+        Command::Touch {
+            x: 0.2,
+            y: 0.2,
+            down,
+        }
+    }
+
+    #[test]
+    fn local_takeover_releases_remote_and_discards_its_remaining_gesture() {
+        let mut arbiter = FollowerInputArbiter::default();
+        assert!(arbiter.remote(&touch(true)));
+        assert_eq!(
+            arbiter.local(&local_touch(true)),
+            LocalDecision {
+                accept: true,
+                release_remote: true
+            }
+        );
+        assert!(
+            !arbiter.remote(&touch(true)),
+            "a remote move cannot re-press during local input"
+        );
+        assert_eq!(
+            arbiter.local(&local_touch(false)),
+            LocalDecision {
+                accept: true,
+                release_remote: false
+            }
+        );
+        assert!(
+            !arbiter.remote(&touch(true)),
+            "remote input stays suppressed until its release"
+        );
+        assert!(!arbiter.remote(&touch(false)));
+        assert!(
+            arbiter.remote(&touch(true)),
+            "a new remote gesture may start after neutral"
+        );
+    }
+
+    #[test]
+    fn rejected_remote_gesture_is_dropped_until_every_contact_is_up() {
+        let mut rejected = RejectedRemote::default();
+        let mapped = |down| Event::MappedTouch {
+            id: 3,
+            x: 0.2,
+            y: 0.3,
+            down,
+        };
+        rejected.reject(&touch(true));
+        assert!(rejected.should_skip(&touch(true)));
+        assert!(rejected.should_skip(&mapped(true)));
+        assert!(rejected.should_skip(&touch(false)));
+        assert!(rejected.should_skip(&mapped(false)));
+        assert!(!rejected.should_skip(&touch(true)));
+    }
+
+    #[test]
+    fn remote_gesture_can_resume_after_it_ends_during_local_control() {
+        let mut arbiter = FollowerInputArbiter::default();
+        assert!(arbiter.remote(&touch(true)));
+        assert!(arbiter.local(&local_touch(true)).release_remote);
+        assert!(!arbiter.remote(&touch(true)));
+        assert!(!arbiter.remote(&touch(false)));
+        assert!(arbiter.local(&local_touch(false)).accept);
+        assert!(arbiter.remote(&touch(true)));
+        assert!(arbiter.remote(&touch(false)));
+    }
+
+    #[test]
+    fn remote_release_and_stale_local_up_do_not_release_the_other_owner() {
+        let mut arbiter = FollowerInputArbiter::default();
+        assert!(arbiter.remote(&touch(true)));
+        assert!(!arbiter.local(&local_touch(false)).accept);
+        assert!(arbiter.local(&local_touch(true)).release_remote);
+        assert!(
+            !arbiter.remote_release(),
+            "leader release cannot lift local touch"
+        );
+        assert!(arbiter.local(&local_touch(false)).accept);
+        assert!(arbiter.remote(&touch(true)));
+        assert!(
+            arbiter.remote_release(),
+            "remote-held input still needs release"
+        );
+    }
+
+    #[test]
+    fn suppression_waits_for_all_remote_contacts_and_keys() {
+        let mut arbiter = FollowerInputArbiter::default();
+        let mapped = |down| Event::MappedTouch {
+            id: 3,
+            x: 0.2,
+            y: 0.2,
+            down,
+        };
+        let key = |down| Event::Key {
+            key: "A".into(),
+            down,
+        };
+        assert!(arbiter.remote(&touch(true)));
+        assert!(arbiter.remote(&mapped(true)));
+        assert!(arbiter.remote(&key(true)));
+        assert!(arbiter.local(&local_touch(true)).release_remote);
+        assert!(arbiter.local(&local_touch(false)).accept);
+        assert!(!arbiter.remote(&touch(false)));
+        assert!(!arbiter.remote(&mapped(false)));
+        assert!(!arbiter.remote(&key(false)));
+        assert!(arbiter.remote(&touch(true)));
+    }
+
+    #[test]
+    fn unlocking_or_disabling_keyboard_releases_the_previous_input() {
+        let mut sync = BridgeSync::new(1080, 2400);
+        assert!(sync.set_mode(
+            SyncRole::Follower,
+            true,
+            Some("L".into()),
+            None,
+            Adaptation::Stretch,
+            true,
+            true,
+            true
+        ));
+        assert!(sync.set_mode(
+            SyncRole::Follower,
+            false,
+            Some("L".into()),
+            None,
+            Adaptation::Stretch,
+            true,
+            true,
+            true
+        ));
+        assert!(sync.set_mode(
+            SyncRole::Follower,
+            false,
+            Some("L".into()),
+            None,
+            Adaptation::Stretch,
+            false,
+            true,
+            true
+        ));
+    }
+
     #[test]
     fn leader_emits_monotonic_seq_lines_and_skips_non_input() {
         let mut sync = BridgeSync::new(1080, 2400);
@@ -265,7 +557,7 @@ mod tests {
     #[test]
     fn follower_never_echoes_and_ignores_locked_user_input() {
         let mut sync = BridgeSync::new(2000, 1000);
-        assert!(!sync.set_mode(
+        assert!(sync.set_mode(
             SyncRole::Follower,
             true,
             Some("L".into()),
@@ -330,7 +622,7 @@ mod tests {
     #[test]
     fn turning_sync_off_requests_release() {
         let mut sync = BridgeSync::new(1080, 2400);
-        assert!(!sync.set_mode(
+        assert!(sync.set_mode(
             SyncRole::Follower,
             true,
             Some("L".into()),
@@ -380,12 +672,39 @@ mod tests {
             y: 0.5,
             down: true
         }));
+        assert!(
+            sync.set_mode(
+                SyncRole::Follower,
+                true,
+                Some("L".into()),
+                None,
+                Adaptation::Stretch,
+                true,
+                true,
+                true
+            ),
+            "locking a follower must release its direct input"
+        );
+        assert!(sync.ignores_user_input(&Command::Touch {
+            x: 0.5,
+            y: 0.5,
+            down: true
+        }));
+        assert!(sync.ignores_user_input(&Command::ToolKey { key: "back".into() }));
+        assert!(sync.ignores_user_input(&Command::MappingHold {
+            id: 1,
+            active: true
+        }));
+        assert!(!sync.ignores_user_input(&Command::MappingHold {
+            id: 1,
+            active: false
+        }));
     }
 
     #[test]
     fn leader_change_resets_seq_and_requests_release_on_remaining_follower() {
         let mut sync = BridgeSync::new(1080, 2400);
-        assert!(!sync.set_mode(
+        assert!(sync.set_mode(
             SyncRole::Follower,
             true,
             Some("A".into()),

@@ -590,6 +590,14 @@ impl Backend for AospBackend {
             .ok()
             .flatten()
     }
+
+    async fn cpu_percent(&self, instance: &InstanceInfo) -> Option<u32> {
+        let pid = instance.pid;
+        tokio::task::spawn_blocking(move || miko_sdk::host::process_cpu_percent(pid))
+            .await
+            .ok()
+            .flatten()
+    }
 }
 
 fn clients_from_lsof(output: Option<&std::process::Output>, me: u32, own: &[u32]) -> bool {

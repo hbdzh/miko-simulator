@@ -121,6 +121,7 @@ fn event_fits_the_format(event: &Event) -> bool {
         Event::Text { text } | Event::Paste { text } => {
             text.len() <= miko_automation::MAX_TEXT_BYTES
         }
+        Event::ScriptCall { .. } => false,
     }
 }
 
@@ -137,6 +138,12 @@ pub fn is_script_command(command: &Command) -> bool {
             | Command::ScriptList
             | Command::ScriptDelete { .. }
             | Command::ScriptRename { .. }
+            | Command::ScriptActionsGet { .. }
+            | Command::ScriptActionDelete { .. }
+            | Command::ScriptActionWait { .. }
+            | Command::ScriptActionMove { .. }
+            | Command::ScriptActionGesture { .. }
+            | Command::ScriptActionCall { .. }
             | Command::ScriptImport { .. }
             | Command::ScriptExport { .. }
             | Command::ScriptPlayStart { .. }
@@ -146,7 +153,24 @@ pub fn is_script_command(command: &Command) -> bool {
     )
 }
 
-/// Whether direct user input must be ignored while a script drives the device.
+/// A new physical action can take ownership; a stale release cannot.
+pub(crate) fn is_manual_takeover(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Touch { down: true, .. }
+            | Command::MappedTouch { down: true, .. }
+            | Command::Key { down: true, .. }
+            | Command::Text { .. }
+            | Command::Paste { .. }
+            | Command::Copy { .. }
+            | Command::Cut { .. }
+            | Command::SelectAll
+            | Command::ToolKey { .. }
+            | Command::Rotate { .. }
+    )
+}
+
+/// Commands excluded from a locked synchronization follower.
 pub(crate) fn is_direct_input(command: &Command) -> bool {
     matches!(
         command,
@@ -169,6 +193,7 @@ pub struct ScriptManager {
     recorder: Option<Recorder>,
     pending_record_count: Option<(Instant, usize)>,
     playback: Option<Playback>,
+    editor: Option<(Uuid, Uuid, miko_automation::ActionDocument)>,
 }
 
 impl ScriptManager {
@@ -183,6 +208,7 @@ impl ScriptManager {
             recorder: None,
             pending_record_count: None,
             playback: None,
+            editor: None,
         }
     }
 
@@ -196,9 +222,14 @@ impl ScriptManager {
         self.recorder.is_some()
     }
 
-    /// True when the UI's direct input must be ignored during playback.
-    pub fn ignores_user_input(&self, command: &Command) -> bool {
-        self.playback.is_some() && is_direct_input(command)
+    /// Stop playback only for a new manual action, not an old release.
+    pub fn take_manual_control(&mut self, command: &Command) -> bool {
+        if self.playback.is_some() && is_manual_takeover(command) {
+            self.stop_playback();
+            true
+        } else {
+            false
+        }
     }
 
     /// Records a whitelisted user command while a recording is running.
@@ -217,6 +248,14 @@ impl ScriptManager {
             },
             now,
         );
+    }
+
+    /// A failed device injection makes an in-progress recording unreliable.
+    pub fn fail_recording(&mut self, message: &str) {
+        if self.recorder.take().is_some() {
+            self.pending_record_count = None;
+            notify(json!({"op":"record", "state":"failed", "code":FAILED_CODE, "message":message}));
+        }
     }
 
     fn record_event(&mut self, event: Event, now: Instant) {
@@ -263,6 +302,69 @@ impl ScriptManager {
             Command::ScriptRename { id, name } => {
                 self.with_id(id, |store, id| store.rename(&id, name).map(|_| ()));
                 self.send_list();
+                ScriptOutcome::default()
+            }
+            Command::ScriptActionsGet { id } => {
+                self.open_editor(id);
+                ScriptOutcome::default()
+            }
+            Command::ScriptActionDelete {
+                id,
+                revision,
+                index,
+            } => {
+                self.edit_script(id, revision, |script| script.delete_action(*index));
+                ScriptOutcome::default()
+            }
+            Command::ScriptActionWait {
+                id,
+                revision,
+                index,
+                wait_ms,
+            } => {
+                self.edit_script(id, revision, |script| {
+                    script.set_wait_before(*index, *wait_ms)
+                });
+                ScriptOutcome::default()
+            }
+            Command::ScriptActionMove {
+                id,
+                revision,
+                from,
+                to,
+            } => {
+                self.edit_script(id, revision, |script| script.move_action(*from, *to));
+                ScriptOutcome::default()
+            }
+            Command::ScriptActionGesture {
+                id,
+                revision,
+                index,
+                x,
+                y,
+                end_x,
+                end_y,
+                duration_ms,
+            } => {
+                self.edit_script(id, revision, |script| {
+                    script.edit_gesture(*index, *x, *y, *end_x, *end_y, *duration_ms)
+                });
+                ScriptOutcome::default()
+            }
+            Command::ScriptActionCall {
+                id,
+                revision,
+                script,
+            } => {
+                if let Ok(target) = Uuid::parse_str(script) {
+                    if let Err(error) = self.store.load(&target) {
+                        notify_store_error(&error);
+                    } else {
+                        self.edit_script(id, revision, |document| document.append_call(target));
+                    }
+                } else {
+                    notify_error(INVALID_CODE, "Invalid fragment id");
+                }
                 ScriptOutcome::default()
             }
             Command::ScriptImport { path } => {
@@ -318,11 +420,30 @@ impl ScriptManager {
         let Some(playback) = self.playback.as_mut() else {
             return ScriptOutcome::default();
         };
-        let outcome = playback.tick(now);
-        if playback.is_finished() {
-            self.playback = None;
+        playback.tick(now)
+    }
+
+    /// Complete a tick only after its input events have been injected.
+    pub fn complete_tick(&mut self, error: Option<&str>) {
+        if let Some(error) = error {
+            if let Some(playback) = self.playback.take() {
+                playback.notify_state("failed", Some(error));
+            }
+        } else if self.playback.as_ref().is_some_and(Playback::is_finished)
+            && let Some(playback) = self.playback.take()
+        {
+            playback.notify_state("finished", None);
         }
-        outcome
+    }
+
+    pub fn executing_event(&mut self, offset: usize) {
+        if let Some(playback) = self.playback.as_mut()
+            && let Some(index) = playback.pending_positions.get(offset).copied()
+            && playback.current_action != Some(index)
+        {
+            playback.current_action = Some(index);
+            playback.notify_state("progress", None);
+        }
     }
 
     // MARK: recording
@@ -421,6 +542,115 @@ impl ScriptManager {
         }
     }
 
+    fn open_editor(&mut self, id: &str) {
+        let Ok(id) = self.parse_id(id) else { return };
+        match self.store.load_actions(&id) {
+            Ok(script) => {
+                self.editor = Some((id, Uuid::new_v4(), script));
+                self.send_editor();
+            }
+            Err(error) => notify_store_error(&error),
+        }
+    }
+
+    fn edit_script(
+        &mut self,
+        id: &str,
+        revision: &str,
+        edit: impl FnOnce(
+            &miko_automation::ActionDocument,
+        ) -> miko_core::MikoResult<miko_automation::ActionDocument>,
+    ) {
+        let Ok(id) = self.parse_id(id) else { return };
+        let Some((opened_id, opened_revision, original)) = self.editor.as_ref() else {
+            notify_error(INVALID_CODE, "Open the script before editing it");
+            return;
+        };
+        if *opened_id != id || opened_revision.to_string() != revision {
+            notify_error(
+                INVALID_CODE,
+                "The open script changed; reopen it before editing",
+            );
+            return;
+        }
+        let result = self.store.load_actions(&id).and_then(|current| {
+            if &current != original {
+                return Err(MikoError::usage(
+                    "The script changed elsewhere; reopen it before editing",
+                ));
+            }
+            let updated = edit(&current)?;
+            self.store.save_actions(&updated)?;
+            Ok(updated)
+        });
+        match result {
+            Ok(updated) => {
+                self.editor = Some((id, Uuid::new_v4(), updated));
+                self.send_editor();
+                self.send_list();
+            }
+            Err(error) => notify_store_error(&error),
+        }
+    }
+
+    fn send_editor(&self) {
+        let Some((id, revision, script)) = &self.editor else {
+            return;
+        };
+        let actions = &script.actions;
+        let mut rows = Vec::with_capacity(actions.len());
+        let mut prior_end = 0;
+        let mut group_start = None;
+        let mut group_end = 0;
+        for (index, action) in actions.iter().enumerate() {
+            let Some((start, end)) = action.time_bounds() else {
+                continue;
+            };
+            if group_start != Some(start) {
+                if group_start.is_some() {
+                    prior_end = prior_end.max(group_end);
+                }
+                group_start = Some(start);
+                group_end = end;
+            } else {
+                group_end = group_end.max(end);
+            }
+            let (kind, detail) = match action {
+                miko_automation::Action::Gesture { samples, .. } => {
+                    let moved = samples.first().is_some_and(|first| {
+                        samples.iter().any(|sample| {
+                            sample.value.x != first.value.x || sample.value.y != first.value.y
+                        })
+                    });
+                    ("gesture", if moved { "swipe" } else { "tap" }.to_owned())
+                }
+                miko_automation::Action::Key { key, .. } => ("key", key.clone()),
+                miko_automation::Action::Text { .. } => ("text", String::new()),
+                miko_automation::Action::Paste { .. } => ("paste", String::new()),
+                miko_automation::Action::ToolKey { key, .. } => ("tool_key", key.clone()),
+                miko_automation::Action::ScriptCall { script, .. } => {
+                    ("script_call", script.to_string())
+                }
+            };
+            let point = match action {
+                miko_automation::Action::Gesture { samples, .. } => samples
+                    .first()
+                    .map(|sample| json!({"x":sample.value.x,"y":sample.value.y})),
+                _ => None,
+            };
+            let endpoint = match action {
+                miko_automation::Action::Gesture { samples, .. } => samples
+                    .last()
+                    .map(|sample| json!({"x":sample.value.x,"y":sample.value.y})),
+                _ => None,
+            };
+            rows.push(json!({"index":index,"kind":kind,"detail":detail,"start_ms":start,"end_ms":end,"wait_ms":start.checked_sub(prior_end),"point":point,"endpoint":endpoint}));
+        }
+        notify(
+            json!({"op":"actions","id":id,"revision":revision,"name":script.name(),"actions":rows}),
+        );
+    }
+
     fn parse_id(&self, id: &str) -> Result<Uuid, ()> {
         match Uuid::parse_str(id) {
             Ok(id) => Ok(id),
@@ -459,8 +689,8 @@ impl ScriptManager {
         let Ok(id) = self.parse_id(id) else {
             return ScriptOutcome::default();
         };
-        let script = match self.store.load(&id) {
-            Ok(script) => script,
+        let (script, positions) = match self.store.resolve_with_positions(&id) {
+            Ok(result) => result,
             Err(error) => {
                 notify_store_error(&error);
                 return ScriptOutcome::default();
@@ -483,10 +713,11 @@ impl ScriptManager {
             }));
             return ScriptOutcome::default();
         }
-        let playback = Playback::new(script, options, now);
+        let mut playback = Playback::new(script, options, now);
+        playback.positions = positions;
         playback.notify_state("playing", None);
         self.playback = Some(playback);
-        ScriptOutcome::default()
+        ScriptOutcome::release()
     }
 
     fn pause_playback(&mut self, now: Instant) -> ScriptOutcome {
@@ -525,6 +756,9 @@ struct Playback {
     options: PlaybackOptions,
     /// Next event index inside the current loop.
     index: usize,
+    positions: Vec<usize>,
+    pending_positions: Vec<usize>,
+    current_action: Option<usize>,
     /// 1-based loop number used in notifications.
     loop_number: u32,
     /// Completed loops.
@@ -546,6 +780,9 @@ impl Playback {
             script,
             options,
             index: 0,
+            positions: Vec::new(),
+            pending_positions: Vec::new(),
+            current_action: None,
             loop_number: 1,
             loops_done: 0,
             virtual_ms: 0.0,
@@ -607,11 +844,18 @@ impl Playback {
         self.virtual_ms += delta.as_secs_f64() * 1000.0 * self.options.speed;
 
         let mut events = Vec::new();
+        self.pending_positions.clear();
         while let Some(timed) = self.script.events.get(self.index) {
             if (timed.t as f64) > self.virtual_ms {
                 break;
             }
             events.push(timed.event.clone());
+            self.pending_positions.push(
+                self.positions
+                    .get(self.index)
+                    .copied()
+                    .unwrap_or(self.index),
+            );
             self.index += 1;
         }
 
@@ -664,7 +908,6 @@ impl Playback {
         self.finished = true;
         self.virtual_ms = 0.0;
         events.shrink_to_fit();
-        self.notify_state("finished", None);
         ScriptOutcome {
             events,
             release: true,
@@ -676,6 +919,8 @@ impl Playback {
             "op": "play",
             "state": state,
             "name": self.script.name,
+            "id": self.script.id,
+            "action_index": self.current_action,
             "loop": self.loop_number,
             "speed": self.options.speed,
             "interval_ms": self.options.interval_ms,
@@ -708,6 +953,7 @@ pub async fn execute_event(
     panel: (u32, u32),
     rotation: &AtomicU32,
     event: &Event,
+    input_lease: Option<&str>,
 ) -> Result<()> {
     let command = match event {
         Event::Touch { x, y, down } => Command::Touch {
@@ -739,11 +985,15 @@ pub async fn execute_event(
             .contains(&key.as_str())
             {
                 client
-                    .call("key.press", json!({"device": device, "key": key}))
+                    .call(
+                        "key.press",
+                        json!({"device": device, "key": key, "input_lease": input_lease}),
+                    )
                     .await?;
             }
             return Ok(());
         }
+        Event::ScriptCall { .. } => anyhow::bail!("unresolved script fragment"),
     };
     state.command(command, panel, rotation).await
 }
@@ -961,6 +1211,148 @@ mod tests {
     }
 
     #[test]
+    fn composite_playback_reports_the_parent_action_for_fragment_events() {
+        let (_temp, mut manager) = recording_manager();
+        let mut parent = sample_script(vec![timed(
+            0,
+            Event::Text {
+                text: "parent".into(),
+            },
+        )]);
+        let mut child = sample_script(vec![timed(
+            0,
+            Event::Text {
+                text: "child".into(),
+            },
+        )]);
+        parent.id = Uuid::new_v4();
+        child.id = Uuid::new_v4();
+        manager.store.save(&parent).unwrap();
+        manager.store.save(&child).unwrap();
+        let document = manager
+            .store
+            .load_actions(&parent.id)
+            .unwrap()
+            .append_call(child.id)
+            .unwrap();
+        manager.store.save_actions(&document).unwrap();
+        let now = Instant::now();
+        manager.handle_command(
+            &Command::ScriptPlayStart {
+                id: parent.id.to_string(),
+                options: None,
+            },
+            now,
+        );
+        let outcome = manager.tick(now);
+        assert_eq!(outcome.events.len(), 2);
+        manager.executing_event(0);
+        assert_eq!(manager.playback.as_ref().unwrap().current_action, Some(0));
+        manager.executing_event(1);
+        assert_eq!(manager.playback.as_ref().unwrap().current_action, Some(1));
+        manager.complete_tick(None);
+        assert!(!manager.is_playing());
+    }
+
+    #[test]
+    fn input_failure_discards_an_incomplete_recording() {
+        let (_temp, mut manager) = recording_manager();
+        let now = Instant::now();
+        manager.handle_command(&Command::ScriptRecordStart, now);
+        manager.record_user_command(
+            &Command::Key {
+                key: "A".into(),
+                down: true,
+            },
+            now,
+        );
+        manager.fail_recording("device input failed");
+        assert!(!manager.is_recording());
+        assert!(manager.pending_record_count.is_none());
+        assert!(manager.store.list().expect("library").is_empty());
+    }
+
+    #[test]
+    fn editor_rejects_stale_requests_and_external_changes() {
+        let (_temp, mut manager) = recording_manager();
+        let script = sample_script(vec![
+            timed(
+                10,
+                Event::Text {
+                    text: "first".into(),
+                },
+            ),
+            timed(
+                20,
+                Event::Text {
+                    text: "second".into(),
+                },
+            ),
+        ]);
+        manager.store.save(&script).expect("save");
+        let id = script.id.to_string();
+        manager.open_editor(&id);
+        let revision = manager.editor.as_ref().expect("open").1.to_string();
+        manager.edit_script(&id, &revision, |script| script.delete_action(0));
+        assert_eq!(
+            manager.store.load(&script.id).expect("load").events.len(),
+            1
+        );
+        manager.edit_script(&id, &revision, |script| script.delete_action(0));
+        assert_eq!(
+            manager
+                .store
+                .load(&script.id)
+                .expect("stale edit did not delete")
+                .events
+                .len(),
+            1
+        );
+
+        let revision = manager.editor.as_ref().expect("open").1.to_string();
+        let mut external = manager.store.load(&script.id).expect("load");
+        external.name = "changed elsewhere".into();
+        manager.store.save(&external).expect("external save");
+        manager.edit_script(&id, &revision, |script| script.set_wait_before(0, 200));
+        assert_eq!(
+            manager
+                .store
+                .load(&script.id)
+                .expect("external change retained"),
+            external
+        );
+    }
+
+    #[test]
+    fn playback_waits_for_injection_result_before_finishing() {
+        let (_temp, mut manager) = recording_manager();
+        let now = Instant::now();
+        let script = sample_script(vec![timed(
+            0,
+            Event::Key {
+                key: "ENTER".to_owned(),
+                down: true,
+            },
+        )]);
+        manager.playback = Some(Playback::new(
+            script.clone(),
+            PlaybackOptions::default(),
+            now,
+        ));
+        let outcome = manager.tick(now);
+        assert!(outcome.release);
+        assert!(manager.is_playing());
+        manager.complete_tick(Some("injection failed"));
+        assert!(!manager.is_playing());
+
+        manager.playback = Some(Playback::new(script, PlaybackOptions::default(), now));
+        manager.tick(now);
+        assert!(manager.is_playing());
+        manager.complete_tick(None);
+        assert!(!manager.is_playing());
+    }
+
+    #[test]
     fn recording_can_be_saved_listed_and_played_with_requested_options() {
         let (_temp, mut manager) = recording_manager();
         let start = Instant::now();
@@ -997,12 +1389,16 @@ mod tests {
         assert_eq!(scripts[0].event_count, 2);
         let options =
             json!({"mode":"count", "count":2, "duration_ms":0, "interval_ms":300, "speed":2.0});
-        manager.handle_command(
+        let start_outcome = manager.handle_command(
             &Command::ScriptPlayStart {
                 id: scripts[0].id.to_string(),
                 options: Some(options),
             },
             start + Duration::from_secs(1),
+        );
+        assert!(
+            start_outcome.release,
+            "playback must release previous manual input"
         );
         let playback = manager
             .playback
@@ -1194,16 +1590,21 @@ mod tests {
     }
 
     #[test]
-    fn direct_input_is_ignored_only_while_playback_is_active() {
-        let command = Command::Touch {
+    fn manual_press_takes_control_but_stale_release_does_not() {
+        let release = Command::Touch {
             x: 0.5,
             y: 0.5,
             down: false,
         };
+        let press = Command::Touch {
+            x: 0.5,
+            y: 0.5,
+            down: true,
+        };
         let temp = tempfile::tempdir().expect("temp dir");
         let mut manager =
             ScriptManager::new(temp.path().to_path_buf(), "dev".to_owned(), 576, 1280);
-        assert!(!manager.ignores_user_input(&command));
+        assert!(!manager.take_manual_control(&press));
         manager.playback = Some(Playback::new(
             sample_script(vec![timed(
                 0,
@@ -1214,7 +1615,9 @@ mod tests {
             PlaybackOptions::default(),
             Instant::now(),
         ));
-        assert!(manager.ignores_user_input(&command));
-        assert!(!manager.ignores_user_input(&Command::Rotate { direction: 1 }));
+        assert!(!manager.take_manual_control(&release));
+        assert!(manager.is_playing());
+        assert!(manager.take_manual_control(&press));
+        assert!(!manager.is_playing());
     }
 }

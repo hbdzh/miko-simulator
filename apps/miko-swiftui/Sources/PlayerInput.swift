@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import Foundation
 
+enum PlayerInputOwnership {
+    /// Toolbar actions can take focus without an AppKit responder transition.
+    static func releasesBeforeToolbarAction(_ type: String) -> Bool {
+        type == "tool_key" || type == "rotate"
+    }
+}
+
 /// Multi-touch gestures with modifiers, matching the Slint player's own
 /// bindings (crates/miko-ui/src/player/input.rs):
 ///

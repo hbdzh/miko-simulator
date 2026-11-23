@@ -141,16 +141,50 @@ async fn read_all<R: AsyncRead + Unpin>(r: Option<R>) -> String {
     s.trim().to_string()
 }
 
+fn before_registration(mut error: MikoError) -> MikoError {
+    let data = error.data.get_or_insert_with(|| json!({}));
+    if let Some(data) = data.as_object_mut() {
+        data.insert("input_released".into(), Value::Bool(true));
+    }
+    error
+}
+
+async fn finish_forward(
+    mut child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    result: MikoResult<(Ended, u64)>,
+) -> MikoResult<(Ended, u64)> {
+    // EOF ends `hid`, and the guest removes the controller.
+    drop(stdin);
+    match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+        Ok(Ok(status)) if status.success() => {}
+        _ => {
+            return Err(MikoError::unexpected(
+                "virtual controller removal was not confirmed",
+            ));
+        }
+    }
+    result.map_err(|mut error| {
+        if let Some(data) = error.data.as_mut().and_then(Value::as_object_mut) {
+            data.insert("input_released".into(), Value::Bool(true));
+        }
+        error
+    })
+}
+
 async fn connect(ctx: &CallCtx, pads: &Pads, p: ConnectParams) -> MikoResult<Value> {
-    let t = target(ctx, &p.device).await?;
+    let t = target(ctx, &p.device).await.map_err(before_registration)?;
     let name = t.device.name.clone();
     let reg = pads.start(t.device.id, || {
         format!(
             "a game controller is already forwarded to {name}; disconnect it first (input.gamepad.disconnect)"
         )
-    })?;
+    }).map_err(before_registration)?;
     let adb = t.adb();
-    let (status, _) = adb.shell_status("command -v hid").await?;
+    let (status, _) = adb
+        .shell_status("command -v hid")
+        .await
+        .map_err(before_registration)?;
     if status != 0 {
         return Err(MikoError::usage(format!(
             "{name} has no `hid` command, which Miko uses to add a game controller"
@@ -163,9 +197,18 @@ async fn connect(ctx: &CallCtx, pads: &Pads, p: ConnectParams) -> MikoResult<Val
     let wanted = p.controller;
     let controller = tokio::task::spawn_blocking(move || host::open(wanted, tx, stop))
         .await
-        .map_err(|e| MikoError::unexpected(format!("opening the controller: {e}")))??;
+        .map_err(|e| {
+            before_registration(MikoError::unexpected(format!(
+                "opening the controller: {e}"
+            )))
+        })?
+        .map_err(before_registration)?;
 
-    let mut child = adb.spawn_with_stdin(&["shell", "hid", "-"])?;
+    ctx.cancel.check().map_err(before_registration)?;
+
+    let mut child = adb
+        .spawn_with_stdin(&["shell", "hid", "-"])
+        .map_err(before_registration)?;
     let mut stdin = child
         .stdin
         .take()
@@ -192,10 +235,8 @@ async fn connect(ctx: &CallCtx, pads: &Pads, p: ConnectParams) -> MikoResult<Val
     }
 
     ctx.report(None, &format!("{} → {name}", controller.name));
-    let (ended, reports) = forward(&mut rx, &mut stdin, &reg.flag, &ctx.cancel).await?;
-    // EOF ends `hid`, and the guest removes the controller.
-    drop(stdin);
-    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    let result = forward(&mut rx, &mut stdin, &reg.flag, &ctx.cancel).await;
+    let (ended, reports) = finish_forward(child, stdin, result).await?;
     Ok(json!({
         "controller": controller,
         "reports": reports,
@@ -277,6 +318,21 @@ mod tests {
             .await
             .unwrap_err();
         assert!(miko_core::cancel::is_cancelled(&e));
+    }
+
+    #[tokio::test]
+    async fn cancelled_forward_closes_input_before_confirming_release() {
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let error = finish_forward(child, stdin, Err(miko_core::cancel::cancelled()))
+            .await
+            .unwrap_err();
+        assert!(miko_core::cancel::is_cancelled(&error));
+        assert_eq!(error.data.unwrap()["input_released"], true);
     }
 
     #[tokio::test]
