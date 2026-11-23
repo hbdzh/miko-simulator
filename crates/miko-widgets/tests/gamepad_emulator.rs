@@ -37,12 +37,13 @@ async fn a_virtual_controller_reaches_android() {
         &[NAME, "KeyLayoutFile", "Classes"],
         "",
         |out| {
-            out.split(NAME).nth(1).is_some_and(|after| {
-                after
-                    .lines()
-                    .take(16)
-                    .any(|l| l.contains("Vendor_045e_Product_028e.kl"))
-            })
+            miko_widgets::gamepad::android_input_device_present(out, NAME)
+                && out.split(NAME).nth(1).is_some_and(|after| {
+                    after
+                        .lines()
+                        .take(16)
+                        .any(|l| l.contains("Vendor_045e_Product_028e.kl"))
+                })
         },
     )
     .await;
@@ -53,6 +54,7 @@ async fn a_virtual_controller_reaches_android() {
         PadEvent::Button(Button::South, false),
         PadEvent::Axis(Axis::LeftX, 1.0),
         PadEvent::Axis(Axis::LeftX, 0.0),
+        PadEvent::Disconnected,
     ] {
         tx.send(ev).await.unwrap();
     }
@@ -89,6 +91,9 @@ async fn a_virtual_controller_reaches_android() {
         !e.shell("dumpsys input").contains(NAME)
     })
     .await;
+    miko_widgets::gamepad::android_confirm_gamepad_removal(&adb, NAME)
+        .await
+        .unwrap();
 
     env.stop().await;
 }

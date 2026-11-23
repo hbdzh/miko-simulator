@@ -23,20 +23,6 @@ struct SDKStatus: Decodable {
 struct CacheEntry: Decodable { let size: UInt64 }
 struct AboutInfo: Decodable { let version: String; let repository: String }
 
-/// Keep the native pop-up menu and its keyboard behavior while giving its
-/// closed control the same system glass treatment as the surrounding window.
-private struct SettingsGlassPicker: ViewModifier {
-    @ViewBuilder func body(content: Content) -> some View {
-        if #available(macOS 26.0, *) {
-            content.pickerStyle(.menu).buttonStyle(.borderless).controlSize(.regular)
-                .padding(.horizontal, 6).padding(.vertical, 3)
-                .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        } else {
-            content.pickerStyle(.menu).buttonStyle(.bordered).controlSize(.regular)
-        }
-    }
-}
-
 /// Match settings actions to the shared pill buttons used by the agent page.
 private struct SettingsPanelButtonStyle: ViewModifier {
     var prominent = false
@@ -332,7 +318,7 @@ struct SettingsView: View {
                                     Text("中文").tag(1)
                                     Text("English").tag(0)
                                 }
-                                .labelsHidden().modifier(SettingsGlassPicker()).frame(width: 180)
+                                .labelsHidden().wbDropdownStyle().frame(width: 180)
                             }
                             .padding(10)
                         }
@@ -633,7 +619,7 @@ struct SettingsView: View {
 
     private func defaultRootRadioOption(value: String, title: String, subtitle: String) -> some View {
         let selected = policy.root == value
-        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
         return Button { policy.root = value } label: {
             HStack(alignment: .top, spacing: 9) {
                 ZStack {
@@ -662,13 +648,11 @@ struct SettingsView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                selected ? WbColor.accentContainer.opacity(0.65) : Color.primary.opacity(0.035),
-                in: shape
-            )
+            .modifier(WbCardMaterial())
+            .background(selected ? WbColor.accentContainer.opacity(0.65) : .clear, in: shape)
             .overlay(
                 shape.strokeBorder(
-                    selected ? WbColor.accentText.opacity(0.65) : WbColor.borderDefault.opacity(0.8),
+                    selected ? WbColor.accentText.opacity(0.65) : .clear,
                     lineWidth: 1
                 )
             )

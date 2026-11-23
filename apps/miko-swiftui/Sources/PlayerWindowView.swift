@@ -174,6 +174,7 @@ struct ContentView: View {
     @ObservedObject var chrome: PlayerChromeState
     @State private var notice: String?
     @State private var noticeGeneration = 0
+    @State private var gamepadPanelShown = false
 
     init(transport: PlayerTransport, mapping: KeyMappingStore, sidebar: SidebarState,
          chrome: PlayerChromeState = PlayerChromeState()) {
@@ -483,7 +484,7 @@ struct ContentView: View {
                 let anchor = CGPoint(x: rect.minX + rect.width * pending.x, y: rect.minY + rect.height * pending.y)
                 let cardSize = CGSize(width: 176, height: 34)
                 HStack(spacing: WbSpace.xs) {
-                    Text(t("请按键盘绑定…", "Press a key…", language))
+                    Text(t("按键盘或已连接手柄控件绑定…", "Press a key or connected controller button…", language))
                         .wbFont(WbType.caption.weighted(.medium))
                     Button {
                         mapping.clearSelection()
@@ -799,9 +800,10 @@ struct ContentView: View {
 
     private var gamepadTitle: String {
         switch transport.gamepadState {
-        case .connected: return t("断开游戏手柄", "Disconnect game controller", language)
+        case .connected: return t("游戏手柄已连接", "Game controller connected", language)
         case .connecting: return t("正在连接游戏手柄…", "Connecting game controller…", language)
-        case .disconnected: return t("连接游戏手柄", "Connect game controller", language)
+        case .disconnected: return t("游戏手柄", "Game controllers", language)
+        case .failed: return t("游戏手柄连接失败", "Game controller connection failed", language)
         }
     }
 
@@ -844,8 +846,11 @@ struct ContentView: View {
                     tool(gamepadTitle,
                          transport.gamepadState == .connected ? "gamecontroller.fill" : "gamecontroller",
                          enabled: linkState.isRunning && transport.gamepadState != .connecting,
-                         active: transport.gamepadState != .disconnected,
-                         activeTint: transport.gamepadState == .connecting ? WbColor.warning : WbColor.accent) { transport.onToggleGamepad?() }
+                         active: transport.gamepadState == .connected || transport.gamepadState == .connecting,
+                         activeTint: transport.gamepadState == .connecting ? WbColor.warning : WbColor.accent) { gamepadPanelShown.toggle() }
+                        .popover(isPresented: $gamepadPanelShown, arrowEdge: .leading) {
+                            GamepadPanel(transport: transport)
+                        }
                 }
                 sidebarSeparator
                 Menu {
@@ -930,7 +935,7 @@ struct ContentView: View {
 }
 
 private let sidebarWidth = WbLayout.windowDeviceToolbarWidth
-private let mappingConfigPanelWidth: CGFloat = 288
+private let mappingConfigPanelWidth: CGFloat = 420
 
 private enum KeyMappingActions {
     static func profileTitle(_ mapping: KeyMappingStore, language: Int) -> String {
@@ -1154,28 +1159,24 @@ private struct KeyMappingGlassDropdown: View {
     let text: String
     var muted = false
     let options: () -> [KeyMappingMenuOption]
-    @State private var hovered = false
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 3) {
             Text(text)
                 .font(.system(size: 12.5, weight: muted ? .regular : .medium))
                 .foregroundStyle(muted ? .secondary : .primary)
                 .lineLimit(1)
-            Spacer(minLength: 6)
             Image(systemName: "chevron.up.chevron.down")
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(.secondary)
         }
-        .frame(maxWidth: .infinity)
-        .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .modifier(KeyMappingGlassSurface(cornerRadius: 7, hovered: hovered))
+        .contentShape(Rectangle())
         .overlay {
             KeyMappingMenuTriggerOverlay(options: options)
+                .accessibilityLabel(text)
         }
-        .animation(.easeOut(duration: 0.14), value: hovered)
-        .onHover { hovered = $0 }
+        .frame(maxWidth: .infinity, alignment: .trailing)
     }
 }
 
@@ -1198,6 +1199,8 @@ private struct KeyMappingListRow<MenuContent: View>: View {
                         .frame(width: 18)
                     Text(title)
                         .font(.system(size: 12.5, weight: selected ? .medium : .regular))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                         .foregroundStyle(selected ? PlayerChromePalette.accentIcon : .primary)
                     Spacer(minLength: 4)
                     Text(detail)
@@ -1279,12 +1282,23 @@ private struct KeyMappingGlassFooterButtonStyle: ButtonStyle {
     }
 }
 
+private struct SchemeActionStyle: ButtonStyle {
+    @State private var hovered = false
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12))
+            .background(Color.primary.opacity(configuration.isPressed ? 0.10 : (hovered ? 0.05 : 0)))
+            .onHover { hovered = $0 }
+    }
+}
+
 private struct KeyMappingSidePanel: View {
     @ObservedObject var transport: PlayerTransport
     @ObservedObject var mapping: KeyMappingStore
     @ObservedObject var chrome: PlayerChromeState
     var overlay = false
     @State private var appliedTemplate: MappingTemplate?
+    @AppStorage("miko.keymap.autoSwitch") private var globalAutoSwitch = false
 
     private var language: Int { transport.language }
     private var rotation: Int { mapping.currentRotation }
@@ -1299,16 +1313,15 @@ private struct KeyMappingSidePanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    addSection
-                    unifiedListSection
-                    selectedBindingSection
-                    schemeSection
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 16)
+            VStack(alignment: .leading, spacing: 12) {
+                addSection
+                unifiedListSection
+                    .frame(maxHeight: .infinity)
+                    .layoutPriority(1)
+                schemeSection
             }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
             Rectangle()
                 .fill(PlayerChromePalette.hairline)
                 .frame(height: PlayerChromeMetrics.hairline)
@@ -1336,23 +1349,77 @@ private struct KeyMappingSidePanel: View {
     }
 
     private func inspectorGroup<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
-        return content()
-            .background(Color.primary.opacity(0.04), in: shape)
-            .clipShape(shape)
-            .overlay(
-                shape.strokeBorder(Color.primary.opacity(0.09), lineWidth: 0.5)
-                    .allowsHitTesting(false)
-            )
+        content().modifier(WbCardMaterial())
     }
 
     private var addSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             sectionLabel(t("添加键位", "Add Control", language))
-            HStack(spacing: 10) {
-                toolButton(mode: .tap, icon: "hand.point.up.left", title: t("单点按键", "Tap Key", language))
-                toolButton(mode: .joystick, icon: "dpad", title: t("方向摇杆", "Joystick", language))
+            placementControl
+            if transport.scripts.isEmpty {
+                Text(t("运行脚本前，请先录制并保存脚本。", "Record and save a script before using Run Script.", language))
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+        }
+    }
+
+    private var placementControl: some View {
+        let tools: [(MappingPlacementMode, String, String)] = [
+            (.none, t("无", "None", language), "cursorarrow"),
+            (.tap, t("单点", "Tap", language), "hand.tap"),
+            (.joystick, t("方向摇杆", "Joystick", language), "dpad"),
+            (.repeatTap, t("连点", "Repeat", language), "repeat"),
+            (.swipe, t("滑动", "Swipe", language), "arrow.right"),
+            (.gesture, t("录制手势", "Gesture", language), "scribble"),
+            (.fpsView, t("射击视角", "FPS View", language), "viewfinder"),
+            (.skillAim, t("技能瞄准", "Skill Aim", language), "scope"),
+            (.script, t("运行脚本", "Run Script", language), "play.rectangle")
+        ]
+        return LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 5), count: 3), spacing: 5) {
+            ForEach(tools, id: \.0) { mode, title, icon in
+                placementButton(title, icon: icon, mode: mode)
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(t("添加键位", "Add Control", language))
+    }
+
+    private func placementButton(_ title: String, icon: String, mode: MappingPlacementMode) -> some View {
+        let selected = mapping.placementMode == mode
+        let unavailable = mode == .script && transport.scripts.isEmpty
+        return Button {
+            if mode == .script { mapping.placementScriptID = transport.scripts.first?.id }
+            mapping.placementMode = mode
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: icon).font(.system(size: 10, weight: .medium))
+                Text(title).font(.system(size: 11, weight: .medium)).lineLimit(1)
+            }
+            .foregroundStyle(selected ? Color(nsColor: .alternateSelectedControlTextColor) : WbColor.textPrimary)
+            .frame(maxWidth: .infinity, minHeight: 28)
+            .background(selected ? Color(nsColor: .controlAccentColor).opacity(0.88) : Color.primary.opacity(0.045),
+                        in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(unavailable)
+        .help(unavailable ? t("请先录制并保存脚本", "Record and save a script first", language) : title)
+        .accessibilityValue(selected ? t("已选择", "Selected", language) : "")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    private func actionTitle(_ action: MappingAction) -> String {
+        switch action {
+        case .tap: return t("单点按键", "Tap Key", language)
+        case .holdToggle: return t("切换长按", "Toggle hold", language)
+        case .repeatHold: return t("按住连点", "Hold to repeat", language)
+        case .repeatToggle: return t("切换连点", "Toggle repeat", language)
+        case .swipe: return t("滑动", "Swipe", language)
+        case .gesture: return t("录制手势", "Recorded gesture", language)
+        case .fpsView: return t("射击视角", "FPS view", language)
+        case .skillAim: return t("技能瞄准", "Skill aim", language)
+        case .script: return t("运行脚本", "Run script", language)
         }
     }
 
@@ -1379,14 +1446,14 @@ private struct KeyMappingSidePanel: View {
                             Text(t("射击视角", "FPS view", language)).tag(MappingAction.fpsView)
                             Text(t("技能瞄准", "Skill aim", language)).tag(MappingAction.skillAim)
                             Text(t("运行脚本", "Run script", language)).tag(MappingAction.script).disabled(transport.scripts.isEmpty)
-                        }
+                        }.wbDropdownStyle()
                         if binding.action == .script {
                             Picker(t("脚本", "Script", language), selection: Binding(
                                 get: { binding.scriptID },
                                 set: { _ = mapping.setScriptAction(key: key, rotation: rotation, scriptID: $0) }
                             )) {
                                 ForEach(transport.scripts) { script in Text(script.name).tag(script.id) }
-                            }
+                            }.wbDropdownStyle()
                         }
                         if binding.action == .repeatHold || binding.action == .repeatToggle {
                             Stepper(value: Binding(
@@ -1416,7 +1483,7 @@ private struct KeyMappingSidePanel: View {
                             }
                         }
                         if binding.action == .fpsView || binding.action == .skillAim {
-                            Text(t("鼠标灵敏度：\(String(format: "%.1f", binding.sensitivity))", "Mouse sensitivity: \(String(format: "%.1f", binding.sensitivity))", language)).font(.caption)
+                            Text(t("视角灵敏度：\(String(format: "%.1f", binding.sensitivity))", "Aim sensitivity: \(String(format: "%.1f", binding.sensitivity))", language)).font(.caption)
                             Slider(value: Binding(get: { binding.sensitivity }, set: { _ = mapping.setAim(key: key, rotation: rotation, sensitivity: $0, radius: binding.aimRadius, cancelX: binding.endX, cancelY: binding.endY) }), in: 0.1...5)
                             Text(t("触控范围：\(Int(binding.aimRadius * 100))%", "Touch radius: \(Int(binding.aimRadius * 100))%", language)).font(.caption)
                             Slider(value: Binding(get: { binding.aimRadius }, set: { _ = mapping.setAim(key: key, rotation: rotation, sensitivity: binding.sensitivity, radius: $0, cancelX: binding.endX, cancelY: binding.endY) }), in: 0.05...0.45)
@@ -1427,16 +1494,16 @@ private struct KeyMappingSidePanel: View {
                                     set: { _ = mapping.setSkillCancelKey(key: key, rotation: rotation, cancelKey: $0.isEmpty ? nil : $0) }
                                 )) {
                                     Text(t("仅右键", "Right-click only", language)).tag("")
-                                    ForEach((Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789").map(String.init) + ["ESC", "SPACE", "TAB", "ENTER", "UP", "DOWN", "LEFT", "RIGHT"]).filter { $0 != key }, id: \.self) { candidate in
+                                    ForEach((Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789").map(String.init) + ["ESC", "SPACE", "TAB", "ENTER", "UP", "DOWN", "LEFT", "RIGHT", "PAD_SOUTH", "PAD_EAST", "PAD_WEST", "PAD_NORTH", "PAD_LEFTBUMPER", "PAD_RIGHTBUMPER", "PAD_LEFTTRIGGER", "PAD_RIGHTTRIGGER"]).filter { $0 != key }, id: \.self) { candidate in
                                         Text(MappingKey.displayLabel(candidate)).tag(candidate)
                                     }
-                                }
+                                }.wbDropdownStyle()
                                 Text(t("取消位置 X：\(Int(binding.endX * 100))%", "Cancel X: \(Int(binding.endX * 100))%", language)).font(.caption)
                                 Slider(value: Binding(get: { binding.endX }, set: { _ = mapping.setAim(key: key, rotation: rotation, sensitivity: binding.sensitivity, radius: binding.aimRadius, cancelX: $0, cancelY: binding.endY) }), in: 0...1)
                                 Text(t("取消位置 Y：\(Int(binding.endY * 100))%", "Cancel Y: \(Int(binding.endY * 100))%", language)).font(.caption)
                                 Slider(value: Binding(get: { binding.endY }, set: { _ = mapping.setAim(key: key, rotation: rotation, sensitivity: binding.sensitivity, radius: binding.aimRadius, cancelX: binding.endX, cancelY: $0) }), in: 0...1)
                             } else {
-                                Text(t("按绑定键捕获或释放鼠标。", "Press the bound key to capture or release the mouse.", language)).font(.caption).foregroundStyle(.secondary)
+                                Text(MappingKey.isGamepad(key) ? t("按绑定手柄键切换视角，使用右摇杆移动。", "Toggle the view with the bound button and move with the right stick.", language) : t("按绑定键捕获或释放鼠标。", "Press the bound key to capture or release the mouse.", language)).font(.caption).foregroundStyle(.secondary)
                             }
                         }
                     }.padding(12)
@@ -1445,40 +1512,28 @@ private struct KeyMappingSidePanel: View {
         }
     }
 
-    private func toolButton(mode: MappingPlacementMode, icon: String, title: String) -> some View {
-        let active = mapping.placementMode == mode
-        return Button {
-            mapping.placementMode = mode
-        } label: {
-            VStack(spacing: 4) {
-                Image(systemName: icon)
-                    .font(.system(size: 14, weight: .medium))
-                Text(title)
-                    .font(.system(size: 12, weight: active ? .semibold : .medium))
-            }
-            .foregroundStyle(active ? PlayerChromePalette.accentIcon : .primary)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 8)
-        }
-        .buttonStyle(KeyMappingGlassButtonStyle(cornerRadius: 8, selected: active))
-    }
-
     private var unifiedListSection: some View {
         let joysticks = mapping.draft.joysticks.enumerated().filter { $0.element.rotation == rotation }
         let bindings = mapping.draft.bindings.filter { $0.rotation == rotation }
         let total = joysticks.count + bindings.count
-        return VStack(alignment: .leading, spacing: 10) {
+        return HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 10) {
             sectionLabel(t("已添加键位", "Added Controls", language) + " · \(total)")
             if total == 0 {
-                inspectorGroup {
-                    Text(t("点击左侧画面添加按键或摇杆。", "Click the screen to add a key or stick.", language))
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 14)
+                VStack(spacing: 5) {
+                    Image(systemName: "cursorarrow.click")
+                        .font(.system(size: 20))
+                    Text(t("轻触左侧画面添加", "Click the screen to add", language))
+                    Text(t("支持点击、长按与方向映射", "Supports taps, holds and directional mapping", language))
+                        .font(.system(size: 11))
                 }
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
                 inspectorGroup {
                     VStack(spacing: 0) {
                         ForEach(Array(joysticks.enumerated()), id: \.element.offset) { pos, item in
@@ -1512,7 +1567,7 @@ private struct KeyMappingSidePanel: View {
                         ForEach(Array(bindings.enumerated()), id: \.element.key) { pos, binding in
                             KeyMappingListRow(
                                 icon: "smallcircle.filled.circle",
-                                title: t("单点按键", "Tap Key", language),
+                                title: actionTitle(binding.action),
                                 detail: MappingKey.displayLabel(binding.key),
                                 selected: mapping.selectedKey == binding.key,
                                 selectAction: { _ = mapping.select(key: binding.key, rotation: rotation) }
@@ -1529,9 +1584,23 @@ private struct KeyMappingSidePanel: View {
                             }
                         }
                     }
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                 }
+                    }
+                }
+                .frame(maxHeight: .infinity, alignment: .top)
+            }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            if mapping.selectedKey != nil {
+                ScrollView {
+                    selectedBindingSection
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
         }
+        .frame(maxHeight: .infinity, alignment: .top)
     }
 
     private func profileMenuOptions() -> [KeyMappingMenuOption] {
@@ -1585,91 +1654,83 @@ private struct KeyMappingSidePanel: View {
     }
 
     private var schemeSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            sectionLabel(t("方案管理", "Profiles", language))
-            inspectorGroup {
-                VStack(alignment: .leading, spacing: 12) {
-                    VStack(spacing: 10) {
-                        HStack(spacing: 10) {
-                            Text(t("当前方案", "Active Profile", language))
-                                .font(.system(size: 12.5))
-                                .foregroundStyle(.primary)
-                            Spacer(minLength: 4)
-                            KeyMappingGlassDropdown(
-                                text: KeyMappingActions.profileTitle(mapping, language: language),
-                                options: profileMenuOptions
-                            )
-                            .frame(width: 158)
-                        }
-
-                        Toggle(t("按前台应用自动切换", "Switch with foreground app", language), isOn: Binding(
-                            get: { mapping.autoSwitchEnabled },
-                            set: { if !mapping.setAutoSwitch($0) { transport.onStatus?(mapping.associationError ?? t("无法保存应用关联", "Could not save app association", language)) } }
-                        )).disabled(mapping.associationError != nil)
-                        if let package = mapping.foregroundPackage {
-                            Text(package).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-                            HStack {
-                                Button(t("关联当前方案", "Bind current profile", language)) {
-                                    if !mapping.associateForegroundWithCurrentProfile() { transport.onStatus?(mapping.associationError ?? t("无法保存应用关联", "Could not save app association", language)) }
-                                }
-                                if mapping.associatedProfile != nil {
-                                    Button(t("移除关联", "Remove binding", language)) { _ = mapping.removeForegroundAssociation() }
-                                }
+        VStack(alignment: .leading, spacing: 8) {
+            sectionLabel(t("键位方案", "Key Mapping Profiles", language))
+            VStack(spacing: 0) {
+                    schemeRow(t("当前方案", "Current Profile", language)) {
+                        KeyMappingGlassDropdown(text: KeyMappingActions.profileTitle(mapping, language: language), options: profileMenuOptions)
+                            .frame(width: 150)
+                    }
+                    schemeDivider
+                    schemeRow(t("关联应用", "Linked App", language)) {
+                        if let package = mapping.currentProfilePackage {
+                            HStack(spacing: 5) {
+                                Circle().fill(Color.green).frame(width: 6, height: 6)
+                                Text(mapping.appNames[package] ?? t("应用名称不可用", "App name unavailable", language))
+                                    .lineLimit(1).truncationMode(.tail).help(package)
+                                Button(t("解除", "Unlink", language)) {
+                                    if !mapping.removeForegroundAssociation() { transport.onStatus?(mapping.associationError ?? t("无法保存应用关联", "Could not save app association", language)) }
+                                }.buttonStyle(.link)
                             }
                         } else {
-                            Text(t("等待前台应用信息…", "Waiting for foreground app…", language)).font(.caption).foregroundStyle(.secondary)
-                        }
-
-                        HStack(spacing: 10) {
-                            Text(t("方案模板", "Template", language))
-                                .font(.system(size: 12.5))
-                                .foregroundStyle(.primary)
-                            Spacer(minLength: 4)
-                            KeyMappingGlassDropdown(
-                                text: appliedTemplate.map { templateTitle($0) } ?? t("选择预设模板", "Choose Template", language),
-                                muted: appliedTemplate == nil,
-                                options: templateMenuOptions
-                            )
-                            .frame(width: 158)
+                            HStack(spacing: 4) {
+                                Text(mapping.foregroundIsLauncher == true ? t("当前为系统桌面", "Home screen", language) : t("未绑定", "Not linked", language)).foregroundStyle(.secondary)
+                                Text("·").foregroundStyle(.secondary)
+                                Button(t("绑定当前", "Link Current", language)) {
+                                    if !mapping.associateForegroundWithCurrentProfile() { transport.onStatus?(mapping.associationError ?? t("无法保存应用关联", "Could not save app association", language)) }
+                                }
+                                .buttonStyle(.link)
+                                .disabled(mapping.foregroundPackage == nil || mapping.foregroundIsLauncher != false || mapping.associationError != nil)
+                                .help(mapping.foregroundIsLauncher == true ? t("当前为系统桌面", "The home screen is in the foreground", language) : t("绑定当前前台应用", "Link the foreground app", language))
+                            }
                         }
                     }
-
-                    Rectangle()
-                        .fill(Color.primary.opacity(0.08))
-                        .frame(height: 0.5)
-
-                    HStack(spacing: 8) {
-                        schemeActionTile(icon: "doc.on.doc", title: t("另存为", "Save As", language)) {
-                            KeyMappingActions.saveAsNewProfile(mapping: mapping, transport: transport, language: language)
-                        }
-                        schemeActionTile(icon: "square.and.arrow.down", title: t("导入", "Import", language)) {
-                            KeyMappingActions.importFromPanel(mapping: mapping, transport: transport, language: language)
-                        }
-                        schemeActionTile(icon: "square.and.arrow.up", title: t("导出", "Export", language)) {
-                            KeyMappingActions.exportToPanel(mapping: mapping, transport: transport, language: language)
-                        }
+                    schemeDivider
+                    schemeRow(t("自动切换方案", "Auto-switch", language)) {
+                        Toggle("", isOn: Binding(get: { globalAutoSwitch }, set: {
+                            if !mapping.setAutoSwitch($0) { transport.onStatus?(mapping.associationError ?? t("无法保存应用关联", "Could not save app association", language)) }
+                        }))
+                        .labelsHidden().toggleStyle(.switch).controlSize(.small)
+                        .disabled(mapping.associationError != nil)
                     }
-                }
-                .padding(14)
+                    schemeDivider
+                    schemeRow(t("预设模板", "Template", language)) {
+                        KeyMappingGlassDropdown(text: appliedTemplate.map { templateTitle($0) } ?? t("选择模板…", "Choose Template…", language), muted: appliedTemplate == nil, options: templateMenuOptions)
+                            .frame(width: 150)
+                    }
+                    schemeDivider
+                    HStack(spacing: 0) {
+                        schemeAction(t("另存为", "Save As", language)) { KeyMappingActions.saveAsNewProfile(mapping: mapping, transport: transport, language: language) }
+                        Rectangle().fill(Color.primary.opacity(0.12)).frame(width: 0.5, height: 20)
+                        schemeAction(t("导入", "Import", language)) { KeyMappingActions.importFromPanel(mapping: mapping, transport: transport, language: language) }
+                        Rectangle().fill(Color.primary.opacity(0.12)).frame(width: 0.5, height: 20)
+                        schemeAction(t("导出", "Export", language)) { KeyMappingActions.exportToPanel(mapping: mapping, transport: transport, language: language) }
+                    }.frame(height: 39)
             }
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .modifier(WbCardMaterial())
         }
+        .fixedSize(horizontal: false, vertical: true)
     }
 
-    private func schemeActionTile(icon: String, title: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 4) {
-                Image(systemName: icon)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(.secondary)
-                Text(title)
-                    .font(.system(size: 11.5, weight: .medium))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 6)
+    private var schemeDivider: some View {
+        Rectangle().fill(Color.primary.opacity(0.10)).frame(height: 0.5)
+    }
+
+    private func schemeRow<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        HStack(spacing: 4) {
+            Text(title).lineLimit(1)
+            Spacer(minLength: 4)
+            content()
         }
-        .buttonStyle(KeyMappingGlassButtonStyle(cornerRadius: 8))
+        .font(.system(size: 12))
+        .padding(.horizontal, 12)
+        .frame(height: 39)
+    }
+
+    private func schemeAction(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) { Text(title).frame(maxWidth: .infinity, maxHeight: .infinity).contentShape(Rectangle()) }
+            .buttonStyle(SchemeActionStyle())
     }
 
     @ViewBuilder private var clearControl: some View {

@@ -118,6 +118,14 @@ impl Adb {
             .map_err(|e| MikoError::sdk(format!("cannot run adb at {}: {e}", self.bin.display())))
     }
 
+    /// Spawn a guest command with both input and output pipes.
+    pub fn spawn_with_stdio(&self, args: &[&str]) -> MikoResult<Child> {
+        self.command(args)
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|e| MikoError::sdk(format!("cannot run adb at {}: {e}", self.bin.display())))
+    }
+
     /// Runs adb and returns its output, whatever the exit status.
     pub async fn raw(&self, args: &[&str]) -> MikoResult<Output> {
         let child = self.command(args).spawn().map_err(|e| {

@@ -1,11 +1,11 @@
 //! JSON-RPC 2.0 over newline-delimited JSON on a Unix socket.
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use miko_adb::Adb;
-use miko_core::provider::{BytesFn, CallCtx, DaemonContext, ProgressFn, parse_params};
+use miko_core::provider::{BytesFn, CallCtx, DaemonContext, InputLease, ProgressFn, parse_params};
 use miko_core::rpc::Notification;
 use miko_core::{ErrorCode, MikoError, MikoResult, ResultExt};
 use schemars::JsonSchema;
@@ -37,13 +37,12 @@ struct InputGuard {
     release_on_success: bool,
 }
 impl InputGuard {
-    fn complete(&mut self) -> MikoResult<()> {
+    fn complete(&mut self, device_stopped: bool) -> MikoResult<()> {
         if self.release_on_success {
-            crate::state::lock(&self.state.input_ownership).release(
-                self.device,
-                self.connection,
-                self.token,
-            )?;
+            let mut ownership = crate::state::lock(&self.state.input_ownership);
+            if !device_stopped || ownership.owns(self.device, self.connection, self.token) {
+                ownership.release(self.device, self.connection, self.token)?;
+            }
         }
         self.released = true;
         Ok(())
@@ -58,6 +57,48 @@ impl Drop for InputGuard {
                 self.token,
             );
         }
+    }
+}
+
+struct GamepadCaptureGuard {
+    state: Arc<crate::state::State>,
+    device: uuid::Uuid,
+}
+
+impl Drop for GamepadCaptureGuard {
+    fn drop(&mut self) {
+        crate::state::lock(&self.state.input_ownership).end_gamepad_capture(self.device);
+    }
+}
+
+struct ResumableInput {
+    guard: Mutex<InputGuard>,
+    cancel: miko_core::Cancel,
+}
+
+impl InputLease for ResumableInput {
+    fn suspend(&self) -> MikoResult<()> {
+        let mut guard = crate::state::lock(&self.guard);
+        if guard.released {
+            return Err(MikoError::unexpected("input lease is already suspended"));
+        }
+        guard.complete(false)
+    }
+
+    fn resume(&self) -> MikoResult<()> {
+        let mut guard = crate::state::lock(&self.guard);
+        if !guard.released {
+            return Err(MikoError::unexpected("input lease is already active"));
+        }
+        self.cancel.check()?;
+        let state = guard.state.clone();
+        let mut ownership = crate::state::lock(&state.input_ownership);
+        let token = ownership.reacquire_job(guard.device, guard.connection)?;
+        guard.token = token;
+        guard.released = false;
+        ownership.pin_job(guard.device, guard.connection, token)?;
+        ownership.set_job_cancel(guard.device, guard.connection, token, self.cancel.clone())?;
+        Ok(())
     }
 }
 
@@ -398,7 +439,8 @@ impl Daemon {
             )
         });
         // Any command naming a device is activity on it (auto-hibernate).
-        if let Some(sel) = params.get("device").and_then(Value::as_str)
+        if method != "input.gamepad.get"
+            && let Some(sel) = params.get("device").and_then(Value::as_str)
             && let Ok(d) = self.state.device(sel).await
         {
             self.state.touch(d.id);
@@ -445,6 +487,19 @@ impl Daemon {
             } else {
                 None
             };
+            let capture = if method == "input.gamepad.capture" {
+                let selector = params["device"]
+                    .as_str()
+                    .ok_or_else(|| MikoError::usage("missing input device"))?;
+                let device = self.state.device(selector).await?.id;
+                crate::state::lock(&self.state.input_ownership).begin_gamepad_capture(device)?;
+                Some(GamepadCaptureGuard {
+                    state: self.state.clone(),
+                    device,
+                })
+            } else {
+                None
+            };
             let (guard, device) = if spec.locks_device {
                 let selector = params
                     .get("device")
@@ -459,7 +514,7 @@ impl Daemon {
             } else if method == "flow.run" {
                 (None, input_guard.as_ref().map(|guard| guard.device))
             } else {
-                (None, None)
+                (None, capture.as_ref().map(|guard| guard.device))
             };
             let daemon: Arc<dyn DaemonContext> = self.state.clone();
             if !spec.long_running {
@@ -469,7 +524,7 @@ impl Daemon {
                 if (result.is_ok() || result.as_ref().is_err_and(input_failed_before_injection))
                     && let Some(guard) = input_guard.as_mut()
                 {
-                    guard.complete()?;
+                    guard.complete(false)?;
                 }
                 return result;
             }
@@ -516,12 +571,26 @@ impl Daemon {
                     }),
                 );
             });
+            let shared_input = input_guard.take().map(|guard| {
+                Arc::new(ResumableInput {
+                    guard: Mutex::new(guard),
+                    cancel: cancel.clone(),
+                })
+            });
+            let input_lease = if method == "input.gamepad.connect" {
+                shared_input
+                    .as_ref()
+                    .map(|guard| guard.clone() as Arc<dyn InputLease>)
+            } else {
+                None
+            };
             let ctx = CallCtx {
                 daemon: daemon.clone(),
                 progress,
                 bytes,
                 cancel,
                 connection: Some(conn),
+                input_lease,
             };
             let jobs = self.jobs.clone();
             daemon.emit(
@@ -531,9 +600,19 @@ impl Daemon {
             tokio::spawn(async move {
                 let _guard = guard;
                 let result = provider.call(&ctx, &method, params).await;
-                let result = match (result, input_guard.as_mut()) {
-                    (Ok(value), Some(guard)) => guard.complete().map(|()| value),
-                    (Err(error), Some(guard))
+                drop(capture);
+                let result = match (result, shared_input.as_ref()) {
+                    (Ok(value), Some(lease)) => {
+                        let mut guard = crate::state::lock(&lease.guard);
+                        if guard.released {
+                            Ok(value)
+                        } else {
+                            let stopped = method == "input.gamepad.connect"
+                                && value["ended"] == "device_stopped";
+                            guard.complete(stopped).map(|()| value)
+                        }
+                    }
+                    (Err(error), Some(lease))
                         if if matches!(method.as_str(), "flow.run" | "input.gamepad.connect") {
                             error
                                 .data
@@ -547,7 +626,12 @@ impl Daemon {
                             input_failed_before_injection(&error)
                         } =>
                     {
-                        guard.complete().and(Err(error))
+                        let mut guard = crate::state::lock(&lease.guard);
+                        if guard.released {
+                            Err(error)
+                        } else {
+                            guard.complete(false).and(Err(error))
+                        }
                     }
                     (result, _) => result,
                 };

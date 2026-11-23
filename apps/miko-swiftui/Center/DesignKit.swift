@@ -38,7 +38,95 @@ struct WbPillButtonStyle: ButtonStyle {
     }
 }
 
+/// A shared macOS segmented control for mutually exclusive choices.
+struct WbSegmentedControl<Value: Hashable>: View {
+    struct Option {
+        let value: Value
+        let title: String
+        var symbol: String? = nil
+    }
+
+    let label: String
+    let selectedLabel: String
+    @Binding var selection: Value
+    let options: [Option]
+    var iconOnly = false
+    var segmentHeight: CGFloat = 28
+    var fontSize: CGFloat = 12
+    var inset: CGFloat = 3
+    @Environment(\.isEnabled) private var isEnabled
+
+    @ViewBuilder var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
+        let segments = HStack(spacing: 0) {
+            ForEach(options.indices, id: \.self) { index in
+                let option = options[index]
+                let selected = selection == option.value
+                Button { selection = option.value } label: {
+                    HStack(spacing: 4) {
+                        if let symbol = option.symbol { Image(systemName: symbol) }
+                        if !iconOnly { Text(option.title).lineLimit(1) }
+                    }
+                    .font(.system(size: fontSize, weight: .medium))
+                    .foregroundStyle(selected ? Color(nsColor: .alternateSelectedControlTextColor) : WbColor.textPrimary)
+                    .frame(maxWidth: .infinity, minHeight: segmentHeight)
+                    .background(selected ? Color(nsColor: .controlAccentColor).opacity(0.88) : .clear,
+                                in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(option.title)
+                .accessibilityLabel(option.title)
+                .accessibilityValue(selected ? selectedLabel : "")
+                .accessibilityAddTraits(selected ? .isSelected : [])
+            }
+        }
+        .padding(inset)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(label)
+        .onMoveCommand { direction in
+            guard isEnabled, let index = options.firstIndex(where: { $0.value == selection }) else { return }
+            switch direction {
+            case .left: selection = options[max(0, index - 1)].value
+            case .right: selection = options[min(options.count - 1, index + 1)].value
+            default: break
+            }
+        }
+        if #available(macOS 26.0, *) {
+            segments.glassEffect(.regular, in: shape)
+        } else {
+            segments.background(.regularMaterial, in: shape)
+        }
+    }
+}
+
 // MARK: - Surfaces
+
+/// Shared translucent card used throughout the app.
+struct WbCardMaterial: ViewModifier {
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    var radius: CGFloat = 16
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
+        let dark = colorScheme == .dark
+        content
+            .background {
+                shape.fill(reduceTransparency ? Color(nsColor: .windowBackgroundColor) : Color.white.opacity(dark ? 0.08 : 0.36))
+                    .shadow(color: .black.opacity(dark ? 0.10 : 0.08), radius: 12, y: 5)
+                    .allowsHitTesting(false)
+            }
+            .overlay(shape.strokeBorder(dark ? Color.white.opacity(0.16) : Color.black.opacity(0.12)).allowsHitTesting(false))
+    }
+}
+
+extension View {
+    /// Native, borderless menu picker; keeps standard keyboard and accessibility behavior.
+    func wbDropdownStyle() -> some View {
+        pickerStyle(.menu).buttonStyle(.borderless).controlSize(.regular)
+    }
+}
 
 /// A raised card: the base material for panels and sheets.
 struct WbCard<Content: View>: View {
@@ -49,15 +137,15 @@ struct WbCard<Content: View>: View {
         content()
             .padding(padding)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(WbColor.raised, in: RoundedRectangle(cornerRadius: WbRadius.lg, style: .continuous))
+            .modifier(WbCardMaterial())
     }
 }
 
 extension View {
     /// Card material without an extra layout wrapper, for views that already
     /// manage their own padding.
-    func wbCardSurface(radius: CGFloat = WbRadius.lg) -> some View {
-        background(WbColor.raised, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+    func wbCardSurface(radius: CGFloat = 16) -> some View {
+        modifier(WbCardMaterial(radius: radius))
     }
 
     func wbDivider() -> some View {

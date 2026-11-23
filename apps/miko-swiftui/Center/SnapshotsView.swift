@@ -209,8 +209,7 @@ struct SnapshotsView: View {
                         row(snapshot)
                     }
                 }
-                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: WbRadius.md))
-                .overlay(RoundedRectangle(cornerRadius: WbRadius.md).stroke(Color.primary.opacity(0.10), lineWidth: 1))
+                .modifier(WbCardMaterial())
             }
         }
     }

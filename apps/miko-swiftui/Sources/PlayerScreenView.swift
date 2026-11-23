@@ -26,6 +26,11 @@ final class ScreenView: NSView, NSTextInputClient {
     private var editingDrag: EditingDrag?
     private var traceRecording: (target: MappingTraceTarget, started: TimeInterval, points: [MappingTracePoint])?
     private var mouseAim: (key: UInt16, binding: MappingBinding, state: MappingAimState)?
+    private var gamepadAim: (key: UInt16, binding: MappingBinding, state: MappingAimState)?
+    private var gamepadAimTimer: DispatchWorkItem?
+    private var gamepadAxes: [String: Double] = [:]
+    private var gamepadPhysicalDown = Set<String>()
+    private var gamepadJoystick: (id: Int, x: Double, y: Double)?
     private var consumedCancelKeys = Set<UInt16>()
     private var priorMouseMovedEvents = false
     func present(_ frame: CGImage, rotation next: Int) {
@@ -257,7 +262,8 @@ final class ScreenView: NSView, NSTextInputClient {
         return nil
     }
     private func nextTouchID() -> Int? {
-        let used = Set(mappedKeys.values.map(\.id)).union(activeJoysticks.values.map(\.id))
+        var used = Set(mappedKeys.values.map(\.id)).union(activeJoysticks.values.map(\.id))
+        if let gamepadJoystick { used.insert(gamepadJoystick.id) }
         return (3...9).first { !used.contains($0) }
     }
     private var imageAspect: Double {
@@ -278,7 +284,7 @@ final class ScreenView: NSView, NSTextInputClient {
             traceRecording = (target, ProcessInfo.processInfo.systemUptime, [MappingTracePoint(x: x, y: y, tMs: 0)])
             return
         }
-        if let mapping = transport?.mapping, mapping.editing {
+        if let mapping = transport?.mapping, mapping.editing, mapping.placementMode != .none {
             let lang = transport?.language ?? 1
             if let hit = bindingHit(at: point), mapping.select(key: hit.key, rotation: rotation) {
                 editingDrag = .binding(key: hit.key, rotation: rotation, start: point, moved: false)
@@ -299,6 +305,7 @@ final class ScreenView: NSView, NSTextInputClient {
             }
             return
         }
+        transport?.takeOverGamepadMapping()
         if mouseAim?.binding.action != .fpsView { releaseMappedKeys() }
         gesture = mouseAim?.binding.action == .fpsView ? .single : PlayerGesture.from(
             option: event.modifierFlags.contains(.option), shift: event.modifierFlags.contains(.shift))
@@ -373,8 +380,8 @@ final class ScreenView: NSView, NSTextInputClient {
         gesture = .single
     }
     override func rightMouseDown(with event: NSEvent) {
-        if cancelMouseSkill() { return }
-        guard let mapping = transport?.mapping, mapping.editing else {
+        if cancelMouseSkill() || cancelGamepadSkill() { return }
+        guard let mapping = transport?.mapping, mapping.editing, mapping.placementMode != .none else {
             super.rightMouseDown(with: event)
             return
         }
@@ -393,12 +400,141 @@ final class ScreenView: NSView, NSTextInputClient {
     }
     private func releaseMappedKeys() {
         _ = cancelMouseSkill()
+        _ = cancelGamepadSkill()
         for key in Array(mappedKeys.keys) { stopMappedControl(key) }
         mappingPhysicalKeys.removeAll()
         for state in activeJoysticks.values { transport?.send(["type": "mapped_touch", "id": state.id, "x": state.x, "y": state.y, "down": false]) }
         activeJoysticks.removeAll()
         activeJoystickKeys.removeAll()
+        if let state = gamepadJoystick {
+            transport?.send(["type": "mapped_touch", "id": state.id, "x": state.x, "y": state.y, "down": false])
+        }
+        gamepadJoystick = nil
+        gamepadAxes.removeAll()
+        gamepadAimTimer?.cancel(); gamepadAimTimer = nil; gamepadAim = nil
         releaseMouseAim()
+    }
+
+    @discardableResult private func cancelGamepadSkill() -> Bool {
+        guard let aim = gamepadAim, aim.binding.action == .skillAim, let value = mappedKeys[aim.key] else { return false }
+        mappedKeys[aim.key] = (value.id, aim.binding.endX, aim.binding.endY)
+        transport?.send(["type": "mapped_touch", "id": value.id, "x": aim.binding.endX, "y": aim.binding.endY, "down": true])
+        stopMappedControl(aim.key)
+        return true
+    }
+
+    private let gamepadButtons = ["South", "East", "West", "North", "LeftBumper", "RightBumper", "Back", "Start", "Guide", "LeftStick", "RightStick", "Up", "Down", "Left", "Right", "LeftTrigger", "RightTrigger"]
+
+    fileprivate func resetGamepadPhysicalState() { gamepadPhysicalDown.removeAll() }
+
+    fileprivate func receiveGamepadEvent(_ event: [String: Any]) {
+        guard !inputBlocked, let kind = event["kind"] as? String, let control = event["control"] as? String else { return }
+        if scriptPlaybackBlocked {
+            let down: Bool?
+            if kind == "button" { down = event["down"] as? Bool }
+            else if kind == "axis", control == "LeftTrigger" || control == "RightTrigger",
+                    let value = event["value"] as? Double, value.isFinite { down = value > 0.01 }
+            else { down = nil }
+            if let down {
+                if down { gamepadPhysicalDown.insert(control) }
+                else { gamepadPhysicalDown.remove(control) }
+            }
+            return
+        }
+        if kind == "button", let down = event["down"] as? Bool {
+            gamepadButton(control, down: down)
+        } else if kind == "axis", let value = event["value"] as? Double, value.isFinite {
+            let value = min(1, max(-1, value))
+            gamepadAxes[control] = value
+            if control == "LeftTrigger" || control == "RightTrigger" {
+                gamepadButton(control, down: value > 0.01)
+            } else if control == "LeftX" || control == "LeftY" {
+                updateGamepadJoystick()
+            } else if (control == "RightX" || control == "RightY"), gamepadAim != nil,
+                      gamepadAimTimer == nil, value != 0 {
+                scheduleGamepadAim()
+            }
+        }
+    }
+
+    private func gamepadButton(_ control: String, down: Bool) {
+        guard let index = gamepadButtons.firstIndex(of: control), let mapping = transport?.mapping else { return }
+        if down {
+            guard gamepadPhysicalDown.insert(control).inserted else { return }
+        } else {
+            guard gamepadPhysicalDown.remove(control) != nil else { return }
+        }
+        let code = UInt16(1000 + index)
+        let key = "PAD_" + control.uppercased()
+        if mapping.editing {
+            if down && (mapping.pending || mapping.selectedKey != nil), mapping.assign(key) {
+                transport?.onStatus?(t("已绑定 ", "Bound ", transport?.language ?? 1) + control)
+            }
+            return
+        }
+        guard mapping.enabled else { return }
+        if down {
+            if consumedCancelKeys.contains(code) { return }
+            if let aim = gamepadAim, aim.binding.cancelsSkill(with: key) {
+                consumedCancelKeys.insert(code)
+                _ = cancelGamepadSkill()
+                return
+            }
+            guard let binding = mapping.scheme.bindings.first(where: { $0.key == key && $0.rotation == rotation }) else { return }
+            startMapping(binding, code: code, isRepeat: false, gamepad: true)
+        } else {
+            if consumedCancelKeys.remove(code) != nil { return }
+            mappingPhysicalKeys.remove(code)
+            if let action = mappedActions[code], action.stopsOnKeyUp { stopMappedControl(code) }
+        }
+    }
+
+    private func updateGamepadJoystick() {
+        guard let mapping = transport?.mapping, mapping.enabled, !mapping.editing,
+              let joystick = mapping.scheme.joysticks.first(where: { $0.rotation == rotation }) else { return }
+        let x = gamepadAxes["LeftX"] ?? 0, y = gamepadAxes["LeftY"] ?? 0
+        if x == 0 && y == 0 {
+            if let state = gamepadJoystick { transport?.send(["type": "mapped_touch", "id": state.id, "x": state.x, "y": state.y, "down": false]) }
+            gamepadJoystick = nil
+            return
+        }
+        let target = joystick.analogTarget(x: x, y: y, aspectWidthOverHeight: imageAspect)
+        if gamepadJoystick == nil {
+            guard let id = nextTouchID() else { return }
+            releaseManualInputs()
+            gamepadJoystick = (id, joystick.x, joystick.y)
+            transport?.send(["type": "mapped_touch", "id": id, "x": joystick.x, "y": joystick.y, "down": true])
+        }
+        guard let current = gamepadJoystick else { return }
+        gamepadJoystick = (current.id, target.x, target.y)
+        transport?.noteInput()
+        transport?.send(["type": "mapped_touch", "id": current.id, "x": target.x, "y": target.y, "down": true])
+    }
+
+    private func scheduleGamepadAim() {
+        gamepadAimTimer?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, var aim = self.gamepadAim, !self.inputBlocked, let value = self.mappedKeys[aim.key] else { return }
+            self.gamepadAimTimer = nil
+            let rect = self.imageRect
+            let x = self.gamepadAxes["RightX"] ?? 0, y = self.gamepadAxes["RightY"] ?? 0
+            if (x != 0 || y != 0) && rect.width > 0 && rect.height > 0 {
+                let speed = min(rect.width, rect.height) * 0.012
+                aim.state.move(dx: x * speed, dy: -y * speed, width: rect.width, height: rect.height)
+                self.mappedKeys[aim.key] = (value.id, aim.state.x, aim.state.y)
+                self.transport?.send(["type": "mapped_touch", "id": value.id, "x": aim.state.x, "y": aim.state.y, "down": true])
+                if aim.binding.action == .fpsView && aim.state.atLimit(width: rect.width, height: rect.height) {
+                    self.transport?.send(["type": "mapped_touch", "id": value.id, "x": aim.state.x, "y": aim.state.y, "down": false])
+                    aim.state = MappingAimState(binding: aim.binding)
+                    self.mappedKeys[aim.key] = (value.id, aim.state.x, aim.state.y)
+                    self.transport?.send(["type": "mapped_touch", "id": value.id, "x": aim.state.x, "y": aim.state.y, "down": true])
+                }
+            }
+            self.gamepadAim = aim
+            if x != 0 || y != 0 { self.scheduleGamepadAim() }
+        }
+        gamepadAimTimer = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(16), execute: work)
     }
 
     @discardableResult private func cancelMouseSkill() -> Bool {
@@ -412,6 +548,7 @@ final class ScreenView: NSView, NSTextInputClient {
     private func beginMouseAim(key: UInt16, binding: MappingBinding) -> Bool {
         guard let window else { return false }
         if let current = mouseAim, !cancelMouseSkill() { stopMappedControl(current.key) }
+        if let current = gamepadAim, !cancelGamepadSkill() { stopMappedControl(current.key) }
         guard CGAssociateMouseAndMouseCursorPosition(0) == .success else {
             transport?.onStatus?(t("无法捕获鼠标，请检查系统权限。", "Could not capture the mouse. Check system permissions.", transport?.language ?? 1))
             return false
@@ -494,6 +631,9 @@ final class ScreenView: NSView, NSTextInputClient {
         repeatCycles.removeAll()
         activeJoysticks.removeAll()
         activeJoystickKeys.removeAll()
+        gamepadJoystick = nil
+        gamepadAxes.removeAll()
+        gamepadAimTimer?.cancel(); gamepadAimTimer = nil; gamepadAim = nil
         editingDrag = nil
         dragging = false
         secondFingerDown = false
@@ -511,6 +651,7 @@ final class ScreenView: NSView, NSTextInputClient {
     }
 
     fileprivate func releaseHeldInputs() {
+        if transport?.mapping.placementMode == MappingPlacementMode.none { editingDrag = nil }
         consumedCancelKeys.removeAll()
         traceRecording = nil
         transport?.mapping.cancelTrace()
@@ -536,6 +677,7 @@ final class ScreenView: NSView, NSTextInputClient {
     }
     override func flagsChanged(with event: NSEvent) {
         guard !inputBlocked else { return }
+        if transport?.mapping.editing != true { transport?.takeOverGamepadMapping() }
         if mouseAim?.binding.action != .fpsView { releaseMappedKeys() }
         for (flag, key) in [(NSEvent.ModifierFlags.shift, "Shift"), (.control, "Control"), (.option, "Alt")] {
             let down = event.modifierFlags.contains(flag)
@@ -549,14 +691,15 @@ final class ScreenView: NSView, NSTextInputClient {
     }
     func handleSkillCancelKeyDown(_ event: NSEvent) -> Bool {
         if consumedCancelKeys.contains(event.keyCode) { return true }
-        guard !syncFollowerLocked, transport?.mapping.editing == false, let aim = mouseAim,
-              aim.binding.action == .skillAim,
+        guard !syncFollowerLocked, transport?.mapping.editing == false,
               !event.modifierFlags.contains(.command), !event.modifierFlags.contains(.control),
               !event.modifierFlags.contains(.option),
-              let key = MappingKey.normalizeCancel(keyCode: event.keyCode, charactersIgnoringModifiers: event.charactersIgnoringModifiers),
-              aim.binding.cancelsSkill(with: key) else { return false }
+              let key = MappingKey.normalizeCancel(keyCode: event.keyCode, charactersIgnoringModifiers: event.charactersIgnoringModifiers) else { return false }
+        let mouseMatches = mouseAim?.binding.cancelsSkill(with: key) == true
+        let gamepadMatches = gamepadAim?.binding.cancelsSkill(with: key) == true
+        guard mouseMatches || gamepadMatches else { return false }
         consumedCancelKeys.insert(event.keyCode)
-        _ = cancelMouseSkill()
+        if mouseMatches { _ = cancelMouseSkill() } else { _ = cancelGamepadSkill() }
         return true
     }
 
@@ -566,7 +709,7 @@ final class ScreenView: NSView, NSTextInputClient {
             return
         }
         if handleSkillCancelKeyDown(event) { return }
-        if let mapping = transport?.mapping, mapping.editing {
+        if let mapping = transport?.mapping, mapping.editing, mapping.placementMode != .none {
             let lang = transport?.language ?? 1
             if event.keyCode == 53 {
                 mapping.clearSelection()
@@ -594,46 +737,10 @@ final class ScreenView: NSView, NSTextInputClient {
         }
         if let mapping = transport?.mapping, !event.modifierFlags.contains(.command), !event.modifierFlags.contains(.control), !event.modifierFlags.contains(.option) {
             if mappingPhysicalKeys.contains(event.keyCode) || activeJoystickKeys[event.keyCode] != nil { return }
-            if mapping.enabled,
+            if mapping.enabled, !mapping.editing,
                let key = MappingKey.normalize(keyCode: event.keyCode, charactersIgnoringModifiers: event.charactersIgnoringModifiers) {
                 if let binding = mapping.scheme.bindings.first(where: { $0.key == key && $0.rotation == rotation }) {
-                    if binding.action == .script {
-                        guard !event.isARepeat else { return }
-                        mappingPhysicalKeys.insert(event.keyCode)
-                        releaseHeldInputs()
-                        transport?.scriptPlayDefault(id: binding.scriptID)
-                        return
-                    }
-                    let decision = MappingPressDecision.decide(action: binding.action, active: mappedKeys[event.keyCode] != nil, physicalDown: mappingPhysicalKeys.contains(event.keyCode), isRepeat: event.isARepeat)
-                    guard decision != .ignore else { return }
-                    releaseManualInputs()
-                    if decision == .stop {
-                        mappingPhysicalKeys.insert(event.keyCode)
-                        stopMappedControl(event.keyCode)
-                        return
-                    }
-                    guard let id = nextTouchID() else { return }
-                    if binding.action == .fpsView || binding.action == .skillAim {
-                        guard beginMouseAim(key: event.keyCode, binding: binding) else { return }
-                    }
-                    mappingPhysicalKeys.insert(event.keyCode)
-                    mappedKeys[event.keyCode] = (id, binding.x, binding.y)
-                    mappedActions[event.keyCode] = binding.action
-                    transport?.noteInput()
-                    if binding.action.holdsOwnershipBetweenTouches {
-                        transport?.send(["type": "mapping_hold", "id": Int(event.keyCode), "active": true])
-                    }
-                    transport?.send(["type": "mapped_touch", "id": id, "x": binding.x, "y": binding.y, "down": true])
-                    if binding.action == .repeatHold || binding.action == .repeatToggle {
-                        repeatCycles[event.keyCode] = MappingRepeatCycle()
-                        let token = UUID()
-                        mappingTokens[event.keyCode] = token
-                        scheduleRepeat(event.keyCode, interval: binding.repeatIntervalMs, token: token)
-                    } else if binding.action == .swipe || binding.action == .gesture {
-                        let token = UUID()
-                        mappingTokens[event.keyCode] = token
-                        scheduleSwipe(event.keyCode, binding: binding, started: ProcessInfo.processInfo.systemUptime, token: token)
-                    }
+                    startMapping(binding, code: event.keyCode, isRepeat: event.isARepeat, gamepad: false)
                     return
                 }
                 for (index, joystick) in mapping.scheme.joysticks.enumerated() where joystick.rotation == rotation {
@@ -644,6 +751,7 @@ final class ScreenView: NSView, NSTextInputClient {
                 }
             }
         }
+        transport?.takeOverGamepadMapping()
         if mouseAim?.binding.action != .fpsView { releaseMappedKeys() }
         if event.isARepeat && pressedKeys[event.keyCode] != nil { return }
         if event.modifierFlags.contains(.command), let key = event.charactersIgnoringModifiers?.lowercased() {
@@ -667,6 +775,44 @@ final class ScreenView: NSView, NSTextInputClient {
         }
         interpretKeyEvents([event])
         pendingKey = nil
+    }
+
+    private func startMapping(_ binding: MappingBinding, code: UInt16, isRepeat: Bool, gamepad: Bool) {
+        if binding.action == .script {
+            guard !isRepeat else { return }
+            mappingPhysicalKeys.insert(code)
+            releaseHeldInputs()
+            transport?.scriptPlayDefault(id: binding.scriptID)
+            return
+        }
+        let decision = MappingPressDecision.decide(action: binding.action, active: mappedKeys[code] != nil,
+                                                    physicalDown: mappingPhysicalKeys.contains(code), isRepeat: isRepeat)
+        guard decision != .ignore else { return }
+        releaseManualInputs()
+        if decision == .stop { mappingPhysicalKeys.insert(code); stopMappedControl(code); return }
+        guard let id = nextTouchID() else { return }
+        if binding.action == .fpsView || binding.action == .skillAim {
+            if gamepad {
+                if let existing = gamepadAim, !cancelGamepadSkill() { stopMappedControl(existing.key) }
+                if let existing = mouseAim, !cancelMouseSkill() { stopMappedControl(existing.key) }
+                gamepadAim = (code, binding, MappingAimState(binding: binding))
+            } else if !beginMouseAim(key: code, binding: binding) { return }
+        }
+        mappingPhysicalKeys.insert(code)
+        mappedKeys[code] = (id, binding.x, binding.y)
+        mappedActions[code] = binding.action
+        transport?.noteInput()
+        if binding.action.holdsOwnershipBetweenTouches { transport?.send(["type": "mapping_hold", "id": Int(code), "active": true]) }
+        transport?.send(["type": "mapped_touch", "id": id, "x": binding.x, "y": binding.y, "down": true])
+        if binding.action == .repeatHold || binding.action == .repeatToggle {
+            repeatCycles[code] = MappingRepeatCycle()
+            let token = UUID(); mappingTokens[code] = token
+            scheduleRepeat(code, interval: binding.repeatIntervalMs, token: token)
+        } else if binding.action == .swipe || binding.action == .gesture {
+            let token = UUID(); mappingTokens[code] = token
+            scheduleSwipe(code, binding: binding, started: ProcessInfo.processInfo.systemUptime, token: token)
+        }
+        if gamepad && (binding.action == .fpsView || binding.action == .skillAim) { scheduleGamepadAim() }
     }
     private func scheduleRepeat(_ keyCode: UInt16, interval: Int, token: UUID) {
         let work = DispatchWorkItem { [weak self] in
@@ -703,6 +849,7 @@ final class ScreenView: NSView, NSTextInputClient {
     }
     private func stopMappedControl(_ keyCode: UInt16) {
         if mouseAim?.key == keyCode { releaseMouseAim() }
+        if gamepadAim?.key == keyCode { gamepadAimTimer?.cancel(); gamepadAimTimer = nil; gamepadAim = nil }
         mappingTimers.removeValue(forKey: keyCode)?.cancel()
         mappingTokens.removeValue(forKey: keyCode)
         let action = mappedActions.removeValue(forKey: keyCode)
@@ -825,6 +972,8 @@ struct PlayerView: NSViewRepresentable {
         let view = ScreenView()
         view.transport = transport
         transport.onReleasePlayerInput = { [weak view] in view?.releaseHeldInputs() }
+        transport.onGamepadEvent = { [weak view] event in view?.receiveGamepadEvent(event) }
+        transport.onGamepadReset = { [weak view] in view?.resetGamepadPhysicalState() }
         transport.mapping.onChange = { [weak view, weak transport] in
             guard let view else { return }
             if let mapping = transport?.mapping, !mapping.enabled || mapping.editing { view.releaseHeldInputs() }

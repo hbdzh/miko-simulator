@@ -96,7 +96,7 @@ struct EditDeviceView: View {
                         })) {
                             Text(model.text("自定义", "Custom")).tag("custom")
                             ForEach(resolutionPresets, id: \.0) { preset in Text(preset.0).tag(preset.0) }
-                        }
+                        }.wbDropdownStyle()
                         .labelsHidden()
                         .frame(width: 180)
                         .accessibilityLabel(model.text("分辨率", "Resolution"))
@@ -121,7 +121,7 @@ struct EditDeviceView: View {
                             Text(model.text("跟随全局", "Follow global")).tag("global")
                             Text(model.text("开启", "On")).tag("on")
                             Text(model.text("停用", "Off")).tag("off")
-                        }
+                        }.wbDropdownStyle()
                         .labelsHidden()
                         .frame(width: 180)
                         .accessibilityLabel(model.text("快速启动", "Quick boot"))
@@ -159,7 +159,7 @@ struct EditDeviceView: View {
                                 Text(model.text("流畅", "Smooth")).tag(0)
                                 Text(model.text("清晰", "Sharp")).tag(1)
                                 Text(model.text("节能", "Power saving")).tag(2)
-                            }
+                            }.wbDropdownStyle()
                             .labelsHidden()
                             .frame(width: 110)
                             .disabled(!qualityLoaded)
@@ -277,6 +277,7 @@ struct EditDeviceView: View {
                 switch result {
                 case .success:
                     model.refresh()
+                    model.refreshCardHardware(details.device.id)
                     if model.selected == details.device.id { model.load(details.device.id) }
                     done(.success(()))
                 case .failure(let failure): done(.failure(failure))

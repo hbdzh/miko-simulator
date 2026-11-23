@@ -23,7 +23,7 @@ struct DeviceRootControls: View {
                     Text(t("无", "None")).tag("none")
                     Text("Shell Root").tag("adb")
                     Text(t("完整 Root", "Full Root")).tag("magisk")
-                }
+                }.wbDropdownStyle()
                 .labelsHidden().frame(width: 170)
                 .accessibilityLabel(t("Root 模式", "Root mode"))
                 .disabled(!device.stopped || busy)

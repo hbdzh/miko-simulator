@@ -8,7 +8,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 private let sidebarWidth: CGFloat = WbLayout.windowDeviceToolbarWidth
-private let mappingPanelWidth: CGFloat = 288
+private let mappingPanelWidth: CGFloat = 420
 private let playerTitlebarHeight: CGFloat = sidebarWidth
 
 // AppKit forbids changing an accessory view's origin while it is attached.

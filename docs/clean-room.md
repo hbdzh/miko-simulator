@@ -30,6 +30,14 @@ Record any non-obvious source you used, so provenance can be audited later.
 
 | Date | Stream | Source | What it informed |
 |---|---|---|---|
+| 2026-11-23 | Gamepad native host | macOS SDK 的 GameController、CoreHaptics 和 IOKit 公开接口；Android SDK `uinput` 反馈 | 使用单一 GameController 输入源和物理震动输出；IOKit 仅用于匹配手柄身份元数据。真实手柄和游戏兼容性尚未验证。 |
+| 2026-11-23 | Gamepad follower | Android 36 临时模拟器、SDK `InputDevice` / `Vibrator` API、播放器桥跟随端实现 | 验证跟随端 `uinput` 注册、按键与摇杆状态及震动启停输出；物理手柄驱动没有参与验证。 |
+| 2026-11-23 | Gamepad uinput | Android SDK `uinput` 公开命令及 Android 36 临时模拟器运行结果 | 独立验证虚拟手柄的按键、轴与震动启停事件；主控原生转发已接入，真实手柄驱动尚未接入。 |
+| 2026-11-23 | Gamepad feedback | macOS SDK 的 `GameController` / `CoreHaptics` 公开接口，以及独立 Swift 编译探测 | 确认目标 SDK 可以编译手柄输入、电量和震动接口调用；本机未检测到手柄，未验证这些接口的设备行为。 |
+| 2026-11-23 | Gamepad feedback | macOS SDK 的 `ForceFeedback.framework` 公开头文件和本机只读 `FFIsForceFeedback` 探测 | 接口可调用，但本机没有返回支持力反馈的 HID 设备；尚不能确认具体手柄能否使用该路径。 |
+| 2026-11-23 | Gamepad battery | macOS `ioreg` 的本机只读输出；现有 gilrs 控制器名称和 VID/PID | 读取系统公开的 `BatteryPercent`，仅在设备身份和注册表条目均唯一匹配时显示；未使用第二个手柄输入源。 |
+| 2026-11-23 | Gamepad feedback | 公开的 Android [`uinput` 命令说明](https://android.googlesource.com/platform/frameworks/base/+/82b08385c0041701acffb86b55bf6b19b5ffc531/cmds/uinput/README.md)、Android SDK 的 `InputDevice` / `Vibrator` API，以及 Android 36 临时模拟器中的独立反馈探测 | 注册支持 `FF_RUMBLE` 的 `uinput` 设备并发起一次模拟震动；宿主端观察到 `vibrating` 的开始和停止通知。现有 `hid` 设备及真实手柄驱动未参与该探测。 |
+| 2026-11-23 | Gamepad feedback | 本地 `gilrs-core` 0.6.8 macOS 后端；Android 36 临时模拟器的 `adb shell dumpsys input` 与 `cmd vibrator_manager help`；公开的 Android [输入设备分类](https://android.googlesource.com/platform/frameworks/native/+/22092af9a0f3582153840f2c829d256bac6c618b/services/inputflinger/reader/include/EventHub.h)和 [hid 输出处理](https://android.googlesource.com/platform/frameworks/base/+/bec242aca086d693f7d21ed68fe72e835dacedaa/cmds/hid/src/com/android/commands/hid/Device.java)（仅用于评估，未移植代码） | macOS gilrs 电量与力反馈能力及 Android 虚拟手柄震动回传的当前限制。 |
 | 2026-11-17 | Integration | Upstream Jidr Apache-2.0 [v0.7.0](https://github.com/jidr-dev/jidr/tree/v0.7.0) and [recording audio](https://github.com/jidr-dev/jidr/commit/13e3b79d84378829728e5ce1ac6a8ff253bdd806) | Ported and adapted network shaping, device IDs, sync, gamepad, ZIP classification and recording audio. GUI is independently adapted to SwiftUI. |
 | 2026-10-13 | A | SDK `emulator/lib/emulator_controller.proto`, `snapshot_service.proto` (emulator 35.6.11) | gRPC bindings (`jidr-proto`) |
 | 2026-10-13 | C | `man 5 cpio` (newc), the Linux kernel's initramfs buffer-format doc, RFC 1952 (gzip), the lz4 frame-format doc (legacy frame), the `.xz` format spec; the local SDK `ramdisk.img` files, read-only, decompressed with the `lz4`/`gzip` CLIs to observe the layout | `jidr-cpio` (Phase 9b) |

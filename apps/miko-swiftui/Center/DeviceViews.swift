@@ -69,7 +69,7 @@ struct DeviceMoreButton: NSViewRepresentable {
             func add(_ zh: String, _ en: String, _ tag: Int, enabled: Bool = true, destructive: Bool = false) {
                 let item = NSMenuItem(title: model.text(zh, en), action: #selector(performAction(_:)), keyEquivalent: "")
                 item.target = self; item.tag = tag; item.isEnabled = enabled
-                let symbols = [6: "shield", 12: "arrow.clockwise", 13: "trash", 14: "moon.zzz"]
+                let symbols = [6: "shield", 12: "arrow.clockwise", 13: "trash", 14: "moon.zzz", 15: "doc.on.doc"]
                 if let symbol = symbols[tag], let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
                     if destructive && enabled,
                        let redImage = image.withSymbolConfiguration(.init(paletteColors: [.systemRed])) {
@@ -96,6 +96,7 @@ struct DeviceMoreButton: NSViewRepresentable {
                 add("重启", "Restart", 12, enabled: device.running && !model.busy.contains(device.id))
             }
             if !menu.items.isEmpty { menu.addItem(.separator()) }
+            add("克隆设备", "Clone device", 15, enabled: device.stopped && !model.busy.contains(device.id) && !model.batchOperations.running)
             add("删除设备", "Delete device", 13, enabled: device.stopped && !model.busy.contains(device.id), destructive: true)
             return menu
         }
@@ -106,6 +107,7 @@ struct DeviceMoreButton: NSViewRepresentable {
             case 12: model.restart(device.id)
             case 13: model.requestDeletion(device.id)
             case 14: model.hibernate(device.id)
+            case 15: model.beginBatch(.clone, ids: [device.id])
             default: break
             }
         }

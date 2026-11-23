@@ -193,7 +193,7 @@ struct DeviceToolPageGroup<Content: View>: View {
                 .font(.system(size: 13))
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(12)
-                .background(WbColor.control.opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
+                .modifier(WbCardMaterial())
             if let footer {
                 footer.font(.system(size: 11))
             }

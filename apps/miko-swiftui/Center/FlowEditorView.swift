@@ -83,46 +83,163 @@ struct FlowEditorView: View {
     private func t(_ zh: String, _ en: String) -> String { model.text(zh,en) }
     private var running: [Device] { model.devices.filter(\.running) }
     private func flow() throws -> [String:Any] { ["name":name,"nodes":try nodes.map { try $0.json() }] }
+    private var selectedRunning: Set<String> { selected.intersection(Set(running.map(\.id))) }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text(t("界面状态流程", "UI workflows")).font(.title2.bold())
-                Spacer()
-                Button(t("打开", "Open"), action: open)
-                Button(t("保存", "Save"), action: save)
-                Button(t("关闭", "Close")) { dismiss() }
-            }
-            HStack { Text(t("流程名称", "Name")); TextField(t("流程名称", "Name"), text:$name) }
-            ScrollView {
-                VStack(alignment:.leading, spacing: 10) {
-                    FlowNodesEditor(model:model, nodes:$nodes, device:running.first(where: { selected.contains($0.id) })?.id)
-                    Divider()
-                    Text(t("运行设备", "Devices")).font(.headline)
-                    ForEach(running) { device in
-                        HStack {
-                            Toggle(device.name, isOn:Binding(get:{selected.contains(device.id)},set:{ if $0 { selected.insert(device.id) } else { selected.remove(device.id) } }))
-                                .toggleStyle(.checkbox)
-                            Spacer()
-                            Text(statuses[device.id] ?? "").font(.caption).foregroundStyle(.secondary)
-                            ForEach(["pause","resume","step","stop"], id:\.self) { command in
-                                Button(label(command)) { control(device.id, command) }.disabled(statuses[device.id] == nil)
-                            }
-                        }
-                    }
-                    Toggle(t("启动后暂停，便于单步调试", "Start paused for single-step debugging"),isOn:$paused)
-                    Toggle(t("为每个节点保存截图", "Save a screenshot for each node"),isOn:$screenshots)
-                }.padding(4)
-            }
-            HStack {
-                Text(message).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-                Spacer()
-                Button(t("运行所选设备", "Run on selected devices"), action:run).disabled(selected.isEmpty || nodes.isEmpty)
+        VStack(spacing: 0) {
+            toolbar
+            Divider()
+            HStack(spacing: 0) {
+                canvas
+                Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1)
+                runSidebar.frame(width: 290)
             }
         }
-        .padding(20).frame(minWidth:780,minHeight:620)
+        .frame(minWidth: 780, minHeight: 620)
+        .background(Color(nsColor: .windowBackgroundColor))
         .onAppear { selected = initialDevices.intersection(Set(running.map(\.id))); refresh() }
         .onReceive(timer) { _ in refresh() }
+        .onChange(of: running.map(\.id)) { ids in selected.formIntersection(Set(ids)) }
     }
+
+    private var toolbar: some View {
+        HStack(spacing: 10) {
+            Text(t("界面状态流程", "UI workflows")).foregroundStyle(.secondary).lineLimit(1)
+            Text("/").foregroundStyle(.tertiary)
+            TextField(t("流程名称", "Workflow name"), text: $name)
+                .textFieldStyle(.roundedBorder).frame(width: 240)
+                .accessibilityLabel(t("流程名称", "Workflow name"))
+            Spacer(minLength: 8)
+            Button(t("打开", "Open"), action: open).buttonStyle(WbPillButtonStyle())
+            Button(t("保存", "Save"), action: save).buttonStyle(WbPillButtonStyle())
+            Button { dismiss() } label: { Image(systemName: "xmark") }
+                .buttonStyle(.plain)
+                .frame(width: 28, height: 28).contentShape(Rectangle())
+                .help(t("关闭", "Close")).accessibilityLabel(t("关闭", "Close"))
+        }
+        .padding(.horizontal, 20).frame(height: 52)
+    }
+
+    private var canvas: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text(t("流程节点", "Workflow nodes") + " (\(nodes.count))").font(.headline)
+                Spacer()
+                Button { nodes.append(FlowDraftNode()) } label: {
+                    Label(t("添加节点", "Add node"), systemImage: "plus")
+                }.buttonStyle(.borderedProminent)
+            }
+            if nodes.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "point.3.connected.trianglepath.dotted")
+                        .font(.system(size: 28)).foregroundStyle(.tertiary)
+                    Text(t("点击右上角“添加节点”", "Click Add node to begin"))
+                        .font(.system(size: 13, weight: .medium)).foregroundStyle(.secondary)
+                    Text(t("按顺序编排界面识别与自动化动作", "Arrange recognition and automation actions in order"))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .modifier(WbCardMaterial(radius: 10))
+            } else {
+                ScrollView {
+                    FlowNodesEditor(model: model, nodes: $nodes,
+                                    device: running.first(where: { selectedRunning.contains($0.id) })?.id,
+                                    showsAdd: false)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(2)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var runSidebar: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text(t("运行与调试", "Run and debug")).font(.headline)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(t("目标设备", "Target devices")).font(.subheadline.weight(.semibold))
+                        VStack(alignment: .leading, spacing: 0) {
+                            if running.isEmpty {
+                                Text(t("暂无运行中的设备", "No running devices"))
+                                    .font(.caption).foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, minHeight: 62)
+                            } else {
+                                ForEach(Array(running.enumerated()), id: \.element.id) { index, device in
+                                    if index > 0 { Divider() }
+                                    deviceRow(device)
+                                }
+                            }
+                        }
+                        .modifier(WbCardMaterial(radius: 10))
+                    }
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(t("调试选项", "Debug options")).font(.subheadline.weight(.semibold))
+                        VStack(spacing: 0) {
+                            Toggle(t("启动后暂停（单步调试）", "Start paused for stepping"), isOn: $paused)
+                                .toggleStyle(.switch).controlSize(.small)
+                                .padding(.horizontal, 12).frame(minHeight: 42)
+                            Divider()
+                            Toggle(t("为每个节点保存截图", "Save screenshot per node"), isOn: $screenshots)
+                                .toggleStyle(.switch).controlSize(.small)
+                                .padding(.horizontal, 12).frame(minHeight: 42)
+                        }
+                        .font(.system(size: 12))
+                        .modifier(WbCardMaterial(radius: 10))
+                    }
+                }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+            Divider()
+            VStack(alignment: .leading, spacing: 8) {
+                if !message.isEmpty {
+                    Text(message).font(.caption).foregroundStyle(.secondary)
+                        .textSelection(.enabled).lineLimit(3)
+                }
+                Button(action: run) {
+                    Label(t("运行所选设备", "Run on selected devices") + " (\(selectedRunning.count))", systemImage: "play.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent).controlSize(.large)
+                .disabled(selectedRunning.isEmpty || nodes.isEmpty)
+            }.padding(16)
+        }
+        .frame(maxHeight: .infinity)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
+    }
+
+    private func deviceRow(_ device: Device) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Toggle(device.name, isOn: Binding(
+                    get: { selected.contains(device.id) },
+                    set: { if $0 { selected.insert(device.id) } else { selected.remove(device.id) } }
+                )).toggleStyle(.checkbox).lineLimit(1)
+                Spacer(minLength: 0)
+                if statuses[device.id] != nil {
+                    Menu {
+                        ForEach(["pause", "resume", "step", "stop"], id: \.self) { command in
+                            Button(label(command)) { control(device.id, command) }
+                        }
+                    } label: { Image(systemName: "ellipsis.circle") }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                    .help(t("调试控制", "Debug controls"))
+                }
+            }
+            if let status = statuses[device.id] {
+                Text(status).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+            }
+        }
+        .font(.system(size: 12))
+        .padding(.horizontal, 12).padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     private func label(_ command:String) -> String {
         switch command { case "pause": return t("暂停","Pause"); case "resume": return t("继续","Resume"); case "step": return t("单步","Step"); default:return t("停止","Stop") }
     }
@@ -144,7 +261,7 @@ struct FlowEditorView: View {
     private func run() {
         do {
             let payload = try flow()
-            for device in selected {
+            for device in selectedRunning {
                 statuses[device] = t("正在启动…", "Starting…")
                 model.call("flow.run",["device":device,"flow":payload,"start_paused":paused,"screenshots":screenshots], onProgress: { text,_,_ in statuses[device] = text }) { result in
                     switch result {
@@ -188,17 +305,34 @@ private struct FlowNodesEditor: View {
     @ObservedObject var model: CenterModel
     @Binding var nodes: [FlowDraftNode]
     let device: String?
+    var showsAdd = true
     private func t(_ zh:String,_ en:String)->String { model.text(zh,en) }
     var body: some View {
         VStack(alignment:.leading, spacing:8) {
             ForEach($nodes) { $node in
+                HStack(alignment: .top, spacing: 10) {
+                    VStack(spacing: 0) {
+                        Text("\((nodes.firstIndex(where: { $0.id == node.id }) ?? 0) + 1)")
+                            .font(.system(size: 11, weight: .semibold))
+                            .frame(width: 24, height: 24)
+                            .background(Color.accentColor.opacity(0.12), in: Circle())
+                            .foregroundStyle(Color.accentColor)
+                        if node.id != nodes.last?.id {
+                            Rectangle().fill(Color.secondary.opacity(0.25)).frame(width: 1)
+                                .frame(maxHeight: .infinity)
+                        }
+                    }.frame(width: 24)
                 FlowNodeEditor(model:model,node:$node,device:device,remove:{ nodes.removeAll { $0.id == node.id } }, move:{ delta in
                     guard let index = nodes.firstIndex(where: { $0.id == node.id }) else { return }
                     let target = index + delta
                     if nodes.indices.contains(target) { nodes.swapAt(index,target) }
                 })
+                }
+                .fixedSize(horizontal: false, vertical: true)
             }
-            Button { nodes.append(FlowDraftNode()) } label: { Label(t("添加节点","Add node"),systemImage:"plus") }
+            if showsAdd {
+                Button { nodes.append(FlowDraftNode()) } label: { Label(t("添加节点","Add node"),systemImage:"plus") }
+            }
         }
     }
 }
@@ -219,7 +353,7 @@ private struct FlowNodeEditor: View {
     var body: some View {
         VStack(alignment:.leading,spacing:8) {
             HStack {
-                Picker(t("节点类型","Node type"),selection:$node.type) { ForEach(types,id:\.0) { type in Text(type.1).tag(type.0) } }.labelsHidden().frame(width:200)
+                Picker(t("节点类型","Node type"),selection:$node.type) { ForEach(types,id:\.0) { type in Text(type.1).tag(type.0) } }.wbDropdownStyle().labelsHidden().frame(width:200)
                 Spacer()
                 Button("↑") { move(-1) }; Button("↓") { move(1) }
                 Button(role:.destructive,action:remove) { Image(systemName:"trash") }
@@ -237,7 +371,7 @@ private struct FlowNodeEditor: View {
                     Picker(t("选择录制脚本","Choose recording"),selection:$node.value) {
                         Text(t("选择脚本","Choose a recording")).tag("")
                         ForEach(player.transport.scripts) { script in Text(script.name).tag(script.id) }
-                    }
+                    }.wbDropdownStyle()
                 }
             }
             if ["tap_element","wait_element","branch"].contains(node.type) { locator }
@@ -258,7 +392,7 @@ private struct FlowNodeEditor: View {
                 }
             }
         }
-        .padding(10).background(Color.primary.opacity(0.035),in:RoundedRectangle(cornerRadius:8))
+        .padding(10).modifier(WbCardMaterial())
         .sheet(isPresented:$capture) { FlowTemplateCapture(model:model,device:device,path:$node.template) }
     }
     private func field(_ title:String,_ value:Binding<String>) -> some View {

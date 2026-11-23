@@ -329,6 +329,110 @@ for (operation, state) in [("record", "recording"), ("record", "stopped"), ("pla
 
 require(preview.transport.mapping.begin(), "local key mapping loads without a daemon in preview")
 preview.transport.mapping.cancel()
+let gamepadMapping = preview.transport.mapping
+require(gamepadMapping.begin(), "gamepad mapping enters editing")
+gamepadMapping.place(x: 0.7, y: 0.6, rotation: 0)
+preview.transport.onGamepadEvent?(["kind": "button", "control": "South", "down": true])
+require(gamepadMapping.draft.bindings.contains { $0.key == "PAD_SOUTH" }, "a physical button assigns the pending mapping")
+preview.transport.onGamepadEvent?(["kind": "button", "control": "South", "down": false])
+require(gamepadMapping.addJoystick(x: 0.2, y: 0.7, rotation: 0), "gamepad test has a virtual joystick")
+try gamepadMapping.save()
+var gamepadInputs: [[String: Any]] = []
+preview.transport.inputObserver = { gamepadInputs.append($0) }
+preview.transport.onGamepadEvent?(["kind": "button", "control": "South", "down": true])
+preview.transport.onGamepadEvent?(["kind": "button", "control": "South", "down": false])
+preview.transport.onGamepadEvent?(["kind": "axis", "control": "LeftX", "value": 0.5])
+preview.transport.onGamepadEvent?(["kind": "axis", "control": "LeftX", "value": 0.0])
+let gamepadTouches = gamepadInputs.filter { $0["type"] as? String == "mapped_touch" }
+require(gamepadTouches.count >= 5, "gamepad button and stick emit mapped touch transitions")
+require(gamepadTouches.last?["down"] as? Bool == false, "centered stick releases its touch")
+require(gamepadMapping.begin(), "gamepad skill mapping enters editing")
+require(gamepadMapping.setAction(key: "PAD_SOUTH", rotation: 0, action: .skillAim, repeatIntervalMs: 120), "gamepad skill action is configured")
+require(gamepadMapping.setSkillCancelKey(key: "PAD_SOUTH", rotation: 0, cancelKey: "PAD_EAST"), "gamepad skill cancel button is configured")
+try gamepadMapping.save()
+gamepadInputs.removeAll()
+preview.transport.onGamepadEvent?(["kind": "axis", "control": "RightX", "value": 0.8])
+preview.transport.onGamepadEvent?(["kind": "button", "control": "South", "down": true])
+RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+preview.transport.onGamepadEvent?(["kind": "button", "control": "East", "down": true])
+let skillTouches = gamepadInputs.filter { $0["type"] as? String == "mapped_touch" }
+require(skillTouches.count >= 3, "right stick moves a held skill before cancellation")
+require(skillTouches.last?["down"] as? Bool == false && (skillTouches.last?["x"] as? Double) == 0.5,
+        "gamepad cancellation moves to the configured cancel point and releases")
+preview.transport.onGamepadEvent?(["kind": "button", "control": "East", "down": false])
+preview.transport.onGamepadEvent?(["kind": "button", "control": "South", "down": false])
+gamepadInputs.removeAll()
+preview.transport.onGamepadEvent?(["kind": "button", "control": "South", "down": true])
+RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+preview.transport.onGamepadEvent?(["kind": "button", "control": "South", "down": false])
+let releasedSkill = gamepadInputs.filter { $0["type"] as? String == "mapped_touch" }
+require(releasedSkill.last?["down"] as? Bool == false && (releasedSkill.last?["x"] as? Double ?? 0) > 0.7,
+        "releasing the skill button lifts at the aimed point")
+require(gamepadMapping.begin(), "trigger script mapping enters editing")
+gamepadMapping.place(x: 0.4, y: 0.4, rotation: 0)
+preview.transport.onGamepadEvent?(["kind": "axis", "control": "LeftTrigger", "value": 0.4])
+preview.transport.onGamepadEvent?(["kind": "axis", "control": "LeftTrigger", "value": 0.0])
+require(gamepadMapping.setScriptAction(key: "PAD_LEFTTRIGGER", rotation: 0, scriptID: UUID().uuidString), "trigger script is configured")
+try gamepadMapping.save()
+gamepadInputs.removeAll()
+preview.transport.onGamepadEvent?(["kind": "axis", "control": "LeftTrigger", "value": 0.4])
+preview.transport.onGamepadEvent?(["kind": "axis", "control": "LeftTrigger", "value": 0.7])
+preview.transport.onGamepadEvent?(["kind": "axis", "control": "LeftTrigger", "value": 0.9])
+require(gamepadInputs.filter { $0["type"] as? String == "script_play_start" }.count == 1,
+        "a held analog trigger starts its script only once")
+preview.transport.onGamepadEvent?(["kind": "axis", "control": "LeftTrigger", "value": 0.0])
+screenView.setScriptPlaybackBlocked(true)
+gamepadInputs.removeAll()
+preview.transport.onGamepadEvent?(["kind": "button", "control": "South", "down": true])
+preview.transport.onGamepadEvent?(["kind": "button", "control": "South", "down": false])
+require(!gamepadInputs.contains { $0["type"] as? String == "mapped_touch" }, "script playback suppresses gamepad touch input")
+screenView.setScriptPlaybackBlocked(false)
+preview.transport.onGamepadEvent?(["kind": "button", "control": "South", "down": true])
+preview.transport.onGamepadEvent?(["kind": "button", "control": "South", "down": false])
+require(gamepadInputs.contains { $0["type"] as? String == "mapped_touch" }, "released controls work again after script playback")
+preview.transport.inputObserver = nil
+
+let eventTransport = PlayerTransport()
+eventTransport.gamepadMode = .touch
+var resets = 0, stops = 0, received = 0
+eventTransport.onReleasePlayerInput = { resets += 1 }
+eventTransport.onStopGamepad = { stops += 1 }
+eventTransport.onGamepadEvent = { _ in received += 1 }
+let eventSession = eventTransport.beginGamepadCapture()
+eventTransport.receiveGamepadEvent(["session": eventSession, "sequence": 1, "event": ["kind": "button", "control": "South", "down": true]])
+eventTransport.receiveGamepadEvent(["session": eventSession, "sequence": 2, "event": ["kind": "ended", "reason": "unplugged"]])
+require(eventTransport.gamepadState == .disconnected && eventTransport.gamepadRecovering, "physical disconnection immediately releases and enters recovery")
+eventTransport.receiveGamepadEvent(["session": eventSession, "sequence": 3, "event": ["kind": "heartbeat"]])
+eventTransport.receiveGamepadEvent(["session": eventSession, "sequence": 5, "event": ["kind": "button", "control": "South", "down": false]])
+require(received == 2 && resets >= 3 && stops == 1, "a missing gamepad event releases input and stops the session")
+let takeoverSession = eventTransport.beginGamepadCapture()
+eventTransport.receiveGamepadEvent(["session": takeoverSession, "sequence": 1, "event": ["kind": "button", "control": "South", "down": true]])
+eventTransport.takeOverGamepadMapping()
+let receivedAtTakeover = received
+eventTransport.receiveGamepadEvent(["session": takeoverSession, "sequence": 2, "event": ["kind": "button", "control": "South", "down": true]])
+require(stops == 2 && received == receivedAtTakeover, "manual takeover stops accepting controller input before handoff")
+let failureSession = eventTransport.beginGamepadCapture()
+eventTransport.receiveGamepadEvent(["session": failureSession, "sequence": 1, "event": ["kind": "button", "control": "South", "down": true]])
+eventTransport.handleInputFailure("test")
+let receivedAtFailure = received
+eventTransport.receiveGamepadEvent(["session": failureSession, "sequence": 2, "event": ["kind": "button", "control": "South", "down": true]])
+require(stops == 3 && received == receivedAtFailure, "input injection failure stops accepting controller input")
+let inactiveTransport = PlayerTransport()
+inactiveTransport.gamepadMode = .touch
+var inactiveReleases = 0
+inactiveTransport.onReleasePlayerInput = { inactiveReleases += 1 }
+require(!inactiveTransport.stopGamepadCapture() && inactiveReleases == 0, "stopping an absent capture leaves unrelated input alone")
+inactiveTransport.handleInputFailure("test")
+require(inactiveReleases == 1, "input failure still releases ordinary input without a capture")
+let heartbeatTransport = PlayerTransport()
+heartbeatTransport.gamepadMode = .touch
+var heartbeatStops = 0
+heartbeatTransport.onStopGamepad = { heartbeatStops += 1 }
+_ = heartbeatTransport.beginGamepadCapture()
+heartbeatTransport.startGamepadStatusPolling()
+RunLoop.main.run(until: Date().addingTimeInterval(1.5))
+heartbeatTransport.stopGamepadStatusPolling()
+require(heartbeatStops == 1, "missing controller heartbeats stop the capture")
 var previewNotices: [String] = []
 preview.transport.onStatus = { previewNotices.append($0) }
 preview.transport.send(["type": "tool_key", "key": "home"])

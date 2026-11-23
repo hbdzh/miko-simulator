@@ -92,6 +92,9 @@ pub struct InputAcquireParams {
     /// Request the current preemptible owner to stop and release first.
     #[serde(default)]
     pub takeover: bool,
+    /// Reserve input for a native gamepad sync follower, excluding touch capture.
+    #[serde(default)]
+    pub gamepad_sync: bool,
 }
 
 struct InputTakeoverGuard {
@@ -1483,6 +1486,15 @@ impl CommandProvider for CoreProvider {
                     .ok_or_else(|| MikoError::usage("input ownership requires a connection"))?;
                 let result = {
                     let mut ownership = crate::state::lock(&self.state.input_ownership);
+                    if p.gamepad_sync {
+                        if p.takeover || p.preemptible {
+                            return Err(MikoError::usage(
+                                "native gamepad sync requires a non-preemptible lease without takeover",
+                            ));
+                        }
+                        let token = ownership.acquire_gamepad_sync(device.id, connection)?;
+                        return Ok(json!({"token": token}));
+                    }
                     match ownership.acquire(device.id, connection, p.preemptible) {
                         Ok(token) => Ok((Some(token), None)),
                         Err(error) if p.takeover && error.code == miko_core::ErrorCode::Busy => {

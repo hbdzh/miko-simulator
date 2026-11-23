@@ -259,8 +259,7 @@ struct SyncPanelView: View {
                     .foregroundStyle(WbColor.textSecondary)
             }
             .frame(maxWidth: .infinity, minHeight: 150)
-            .modifier(SyncGlassCardModifier(cornerRadius: WbRadius.lg))
-            .overlay(RoundedRectangle(cornerRadius: WbRadius.lg).strokeBorder(WbColor.borderSubtle, lineWidth: 1))
+            .modifier(WbCardMaterial())
         } else {
             ScrollView {
                 LazyVStack(spacing: WbSpace.xs) {
@@ -331,8 +330,7 @@ struct SyncPanelView: View {
             .font(.system(size: 12))
         }
         .padding(WbSpace.md)
-        .modifier(SyncGlassCardModifier(cornerRadius: WbRadius.lg))
-        .overlay(RoundedRectangle(cornerRadius: WbRadius.lg).strokeBorder(WbColor.borderSubtle, lineWidth: 1))
+        .modifier(WbCardMaterial())
     }
 
     private var actionRow: some View {
@@ -532,10 +530,10 @@ private struct SyncDeviceRow: View {
         }
         .padding(.horizontal, WbSpace.md)
         .padding(.vertical, 8)
-        .modifier(SyncGlassCardModifier(cornerRadius: WbRadius.md))
+        .modifier(WbCardMaterial())
         .overlay(
-            RoundedRectangle(cornerRadius: WbRadius.md)
-                .strokeBorder(isLeader ? WbColor.accent.opacity(0.55) : WbColor.borderSubtle, lineWidth: 1)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(isLeader ? WbColor.accent.opacity(0.55) : .clear, lineWidth: 1)
         )
         .onHover { hovered = $0 }
         .contextMenu {

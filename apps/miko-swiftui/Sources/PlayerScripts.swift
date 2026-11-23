@@ -752,7 +752,7 @@ struct PlaybackOptionsPopover: View {
                         ForEach(PlaybackMode.allCases, id: \.self) { item in
                             Text(PlayerScriptText.mode(item, language: language)).tag(item.rawValue)
                         }
-                    }.labelsHidden().accessibilityLabel(t("模式", "Mode", language)).frame(width: 145, alignment: .trailing)
+                    }.wbDropdownStyle().labelsHidden().accessibilityLabel(t("模式", "Mode", language)).frame(width: 145, alignment: .trailing)
                 }
                 if mode == PlaybackMode.count.rawValue {
                     GridRow {
@@ -785,7 +785,7 @@ struct PlaybackOptionsPopover: View {
                         ForEach([0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0], id: \.self) { value in
                             Text(String(format: "%.2g×", value)).tag(value)
                         }
-                    }.labelsHidden().accessibilityLabel(t("倍速", "Speed", language)).frame(width: 145, alignment: .trailing)
+                    }.wbDropdownStyle().labelsHidden().accessibilityLabel(t("倍速", "Speed", language)).frame(width: 145, alignment: .trailing)
                 }
             }
             .font(.system(size: 13))

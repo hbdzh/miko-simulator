@@ -175,6 +175,8 @@ final class SyncHub: ObservableObject {
     private var activeFollowers: Set<String> = []
     private var appliedModes: [String: AppliedSyncMode] = [:]
     private var relayGeneration: UInt64 = 0
+    private var nativeSession: String?
+    private var blockedNativeSession: String?
     private var counters: [String: SyncFollowerCounters] = [:]
     private var lastReportAt: [String: TimeInterval] = [:]
     private var latencySamples: [Double] = []
@@ -187,13 +189,15 @@ final class SyncHub: ObservableObject {
             backgroundOwned.insert(deviceID)
         }
         let currentSession = session
-        if let currentSession, currentSession.followers.contains(where: { $0.device == deviceID }) {
+        let canRelay = overflows[deviceID, default: 0] < Self.overflowLimit
+        if let currentSession, currentSession.followers.contains(where: { $0.device == deviceID }),
+           canRelay {
             activeFollowers.insert(deviceID)
         }
         stateLock.unlock()
 
         applyRole(for: deviceID, on: target, session: currentSession, force: true)
-        if let currentSession,
+        if canRelay, let currentSession,
            currentSession.followers.contains(where: { $0.device == deviceID && $0.status == .detached }) {
             let c = counters[deviceID] ?? SyncFollowerCounters()
             reportHealth?(deviceID, .ready, c)
@@ -233,18 +237,38 @@ final class SyncHub: ObservableObject {
         appliedModes.removeValue(forKey: deviceID)
         activeFollowers.remove(deviceID)
         let currentSession = session
-        let followerTargets: [SyncBridgeTarget] = currentSession?.followers.compactMap { bridges[$0.device] } ?? []
         let c = counters[deviceID] ?? SyncFollowerCounters()
         stateLock.unlock()
 
         guard let currentSession else { return }
         if currentSession.leader == deviceID {
-            for target in followerTargets {
-                target.sendSyncRelease()
-            }
+            releaseFollowers(from: deviceID)
         } else if currentSession.followers.contains(where: { $0.device == deviceID }) {
             reportHealth?(deviceID, .detached, c)
         }
+    }
+
+    /// A failed follower cannot safely resume halfway through an input stream.
+    func failFollower(_ deviceID: String, message: String) {
+        guard let session, session.followers.contains(where: { $0.device == deviceID }) else { return }
+        stateLock.lock()
+        guard activeFollowers.remove(deviceID) != nil else {
+            stateLock.unlock()
+            return
+        }
+        overflows[deviceID] = Self.overflowLimit
+        pendingQueues.removeValue(forKey: deviceID)
+        downFingers.removeValue(forKey: deviceID)
+        let c = counters[deviceID] ?? SyncFollowerCounters()
+        let target = bridges[deviceID]
+        let queue = queues[deviceID]
+        stateLock.unlock()
+        if let target, let queue {
+            queue.async { target.sendSyncRelease() }
+        } else {
+            target?.sendSyncRelease()
+        }
+        reportHealth?(deviceID, .error(message), c)
     }
 
     /// Releases held inputs on all followers when the leader pauses or stops
@@ -257,12 +281,27 @@ final class SyncHub: ObservableObject {
         pendingQueues.removeAll()
         lastDeadlines.removeAll()
         downFingers.removeAll()
-        let followerTargets: [SyncBridgeTarget] = currentSession.followers.compactMap { bridges[$0.device] }
+        let followerTargets: [(SyncBridgeTarget, DispatchQueue?)] = currentSession.followers.compactMap {
+            guard let target = bridges[$0.device] else { return nil }
+            return (target, queues[$0.device])
+        }
         stateLock.unlock()
 
-        for target in followerTargets {
-            target.sendSyncRelease()
+        for (target, queue) in followerTargets {
+            if let queue {
+                queue.async { target.sendSyncRelease() }
+            } else {
+                target.sendSyncRelease()
+            }
         }
+    }
+
+    func observeNativeSession(_ value: String) {
+        nativeSession = value
+    }
+
+    func blockNativeSession() {
+        blockedNativeSession = nativeSession
     }
 
     func applySession(_ next: SyncSessionModel?) {
@@ -270,6 +309,8 @@ final class SyncHub: ObservableObject {
         session = next
 
         if next == nil {
+            nativeSession = nil
+            blockedNativeSession = nil
             totalEventsRelayed = 0
             averageLatencyMs = 0
             latencySamples.removeAll()
@@ -283,7 +324,6 @@ final class SyncHub: ObservableObject {
             downFingers.removeAll()
             overflows.removeAll()
             counters.removeAll()
-            queues.removeAll()
             let prevMembers = previous.map { [$0.leader] + $0.followers.map(\.device) } ?? []
             var toTurnOff: [(String, SyncBridgeTarget)] = []
             var toReleaseBg: [String] = []
@@ -313,20 +353,23 @@ final class SyncHub: ObservableObject {
 
         stateLock.lock()
         if sessionOrLeaderChanged {
+            nativeSession = nil
+            blockedNativeSession = nil
             relayGeneration &+= 1
             pendingQueues.removeAll()
             lastDeadlines.removeAll()
             downFingers.removeAll()
             overflows.removeAll()
         }
-        activeFollowers = followerIDs.intersection(Set(bridges.keys))
+        activeFollowers = followerIDs.intersection(Set(bridges.keys)).filter {
+            overflows[$0, default: 0] < Self.overflowLimit
+        }
 
         var removedTargets: [(String, SyncBridgeTarget)] = []
         var removedBg: [String] = []
         if let prev = previous {
             let prevIDs = Set([prev.leader] + prev.followers.map(\.device))
             for removed in prevIDs.subtracting(activeIDs) {
-                queues.removeValue(forKey: removed)
                 pendingQueues.removeValue(forKey: removed)
                 lastDeadlines.removeValue(forKey: removed)
                 downFingers.removeValue(forKey: removed)
@@ -385,15 +428,23 @@ final class SyncHub: ObservableObject {
     ) {
         guard let session, session.leader == deviceID else { return }
         guard Self.allowsEvent(event, options: session.options) else { return }
+        if event["type"] as? String == "gamepad", let source = event["session"] as? String,
+           source == blockedNativeSession { return }
 
-        totalEventsRelayed += 1
         let jitterMax = max(0, min(20, session.options.jitter_ms))
         let fingerInfo = Self.classifyFinger(event)
 
         var pendingReports: [(String, SyncFollowerStatus, SyncFollowerCounters)] = []
         var toSchedule: [(String, SyncBridgeTarget, DispatchQueue, DispatchTime, Bool)] = []
+        var toRelease: [(SyncBridgeTarget, DispatchQueue)] = []
 
         stateLock.lock()
+        // A queued callback from a player that has already disconnected must
+        // not start a new gesture after the followers have been released.
+        guard bridges[deviceID] != nil else {
+            stateLock.unlock()
+            return
+        }
         let gen = relayGeneration
         let now = DispatchTime.now()
 
@@ -441,16 +492,18 @@ final class SyncHub: ObservableObject {
                     counters[fid] = c
                     continue
                 } else {
-                    let count = overflows[fid, default: 0] + 1
-                    overflows[fid] = count
+                    // Losing a transition can leave a touch or key held. Stop
+                    // this follower on the first loss, then release on its
+                    // serial queue after any send already in progress.
+                    overflows[fid] = Self.overflowLimit
                     let c = counters[fid] ?? SyncFollowerCounters()
-                    if count >= Self.overflowLimit {
-                        activeFollowers.remove(fid)
-                        pendingQueues[fid] = nil
-                        pendingReports.append((fid, .error("the follower fell too far behind and lost input"), c))
-                    } else {
-                        pendingReports.append((fid, .lagging, c))
+                    activeFollowers.remove(fid)
+                    pendingQueues[fid] = nil
+                    downFingers[fid] = nil
+                    if let queue = queues[fid] {
+                        toRelease.append((target, queue))
                     }
+                    pendingReports.append((fid, .error("the follower fell too far behind and lost input"), c))
                     continue
                 }
             }
@@ -490,6 +543,10 @@ final class SyncHub: ObservableObject {
         }
         stateLock.unlock()
 
+        totalEventsRelayed += 1
+        for (target, queue) in toRelease {
+            queue.async { target.sendSyncRelease() }
+        }
         for (fid, status, c) in pendingReports {
             reportHealth?(fid, status, c)
         }
@@ -572,6 +629,10 @@ final class SyncHub: ObservableObject {
         switch type {
         case "touch", "mapped_touch":
             return true
+        case "gamepad":
+            guard let session = event["session"] as? String, UUID(uuidString: session) != nil,
+                  let sequence = event["sequence"] as? NSNumber, sequence.uint64Value > 0 else { return false }
+            return event["ended"] as? Bool == true || (event["report"] as? [Int])?.count == 13
         case "key":
             return options.sync_keyboard
         case "text", "paste":
@@ -589,6 +650,10 @@ final class SyncHub: ObservableObject {
         status: SyncFollowerStatus,
         counters: SyncFollowerCounters
     ) {
+        stateLock.lock()
+        let active = activeFollowers.contains(deviceID)
+        stateLock.unlock()
+        guard active else { return }
         latencySamples.append(elapsedMs)
         if latencySamples.count > 64 {
             latencySamples.removeFirst(latencySamples.count - 64)
@@ -649,19 +714,27 @@ final class SyncHub: ObservableObject {
         if !unchanged {
             appliedModes[deviceID] = nextMode
         }
+        let queue = queues[deviceID]
         stateLock.unlock()
 
         guard !unchanged else { return }
 
-        target.sendSyncMode(
-            role: nextMode.role,
-            lock: nextMode.lock,
-            leader: nextMode.leader,
-            leaderDisplay: nextMode.leaderDisplay,
-            adaptation: nextMode.adaptation,
-            syncKeyboard: nextMode.syncKeyboard,
-            syncText: nextMode.syncText,
-            syncToolKeys: nextMode.syncToolKeys
-        )
+        let sendMode = {
+            target.sendSyncMode(
+                role: nextMode.role,
+                lock: nextMode.lock,
+                leader: nextMode.leader,
+                leaderDisplay: nextMode.leaderDisplay,
+                adaptation: nextMode.adaptation,
+                syncKeyboard: nextMode.syncKeyboard,
+                syncText: nextMode.syncText,
+                syncToolKeys: nextMode.syncToolKeys
+            )
+        }
+        if let queue {
+            queue.async(execute: sendMode)
+        } else {
+            sendMode()
+        }
     }
 }

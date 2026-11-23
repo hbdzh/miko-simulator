@@ -874,6 +874,9 @@ impl State {
 
 #[async_trait]
 impl DaemonContext for State {
+    fn connection_alive(&self, connection: u64) -> bool {
+        lock(&self.input_ownership).connection_alive(connection)
+    }
     fn paths(&self) -> &MikoPaths {
         &self.paths
     }

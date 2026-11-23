@@ -1,17 +1,16 @@
-//! The game controllers on this machine, read with `gilrs` (IOKit on
-//! macOS). Other hosts are refused for now: `gilrs` needs libudev on Linux.
+//! Host game controllers. macOS uses one GameController service for input and feedback.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use miko_core::MikoResult;
-use serde::Serialize;
-use tokio::sync::mpsc;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, watch};
 
 use super::hid::PadEvent;
 
 /// A controller connected to this machine.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Controller {
     /// Its index for `input.gamepad.connect {controller}`; stable while it
     /// stays connected.
@@ -22,6 +21,30 @@ pub struct Controller {
     pub vendor: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub product: Option<u16>,
+    /// Device currently receiving this physical controller, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bound_device: Option<String>,
+    /// Power information reported by the active gamepad backend.
+    pub power: Power,
+    /// Controls exposed by the current mapping and their live values.
+    pub controls: Vec<Control>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Power {
+    Unknown,
+    Wired,
+    Available { percent: u8 },
+    Charging { percent: u8 },
+    Discharging { percent: u8 },
+    Charged,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Control {
+    pub name: String,
+    pub value: f32,
 }
 
 /// The controller to use: `id`, or the first one.
@@ -46,10 +69,13 @@ pub fn pick(all: &[Controller], id: Option<usize>) -> MikoResult<Controller> {
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{list, open};
+#[path = "host_native.rs"]
+mod native;
+#[cfg(target_os = "macos")]
+pub use native::{list, open, vibrate};
 
 #[cfg(not(target_os = "macos"))]
-pub use unsupported::{list, open};
+pub use unsupported::{list, open, vibrate};
 
 #[cfg(not(target_os = "macos"))]
 mod unsupported {
@@ -63,159 +89,17 @@ mod unsupported {
         Err(refuse())
     }
 
-    pub fn open(
-        _id: Option<usize>,
-        _tx: mpsc::Sender<PadEvent>,
-        _stop: Arc<AtomicBool>,
-    ) -> MikoResult<Controller> {
+    pub fn vibrate(_id: usize, _source: String, _active: bool) -> MikoResult<()> {
         Err(refuse())
     }
-}
 
-#[cfg(target_os = "macos")]
-mod imp {
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
-
-    use gilrs::{EventType, Gilrs};
-    use miko_core::MikoError;
-
-    use super::super::hid::{Axis, Button};
-    use super::*;
-
-    /// How long to wait for the system to report the connected controllers.
-    const SETTLE: Duration = Duration::from_millis(300);
-    /// How often the reader checks its stop flag.
-    const TICK: Duration = Duration::from_millis(100);
-
-    fn start() -> MikoResult<Gilrs> {
-        let mut g = Gilrs::new()
-            .map_err(|e| MikoError::unexpected(format!("reading game controllers: {e}")))?;
-        // Controllers arrive as events once the HID manager has run.
-        while g.next_event_blocking(Some(SETTLE)).is_some() {}
-        Ok(g)
-    }
-
-    fn controllers(g: &Gilrs) -> Vec<Controller> {
-        g.gamepads()
-            .filter(|(_, p)| p.is_connected())
-            .map(|(id, p)| Controller {
-                id: id.into(),
-                name: p.name().to_string(),
-                vendor: p.vendor_id(),
-                product: p.product_id(),
-            })
-            .collect()
-    }
-
-    pub fn list() -> MikoResult<Vec<Controller>> {
-        start().map(|g| controllers(&g))
-    }
-
-    /// Opens controller `id` (default: the first) on a reader thread that
-    /// sends its events until `stop`, the receiver closing, or the
-    /// controller going away.
     pub fn open(
-        id: Option<usize>,
-        tx: mpsc::Sender<PadEvent>,
-        stop: Arc<AtomicBool>,
-    ) -> MikoResult<Controller> {
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("miko-gamepad".into())
-            .spawn(move || {
-                let mut g = match start() {
-                    Ok(g) => g,
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                        return;
-                    }
-                };
-                let chosen = pick(&controllers(&g), id);
-                let want = chosen.as_ref().map(|c| c.id).ok();
-                let _ = ready_tx.send(chosen);
-                let Some(want) = want else { return };
-                while !stop.load(Ordering::Relaxed) {
-                    let Some(ev) = g.next_event_blocking(Some(TICK)) else {
-                        continue;
-                    };
-                    if usize::from(ev.id) != want {
-                        continue;
-                    }
-                    for pe in map(ev.event) {
-                        if tx.blocking_send(pe).is_err() {
-                            return;
-                        }
-                    }
-                    if ev.event == EventType::Disconnected {
-                        return;
-                    }
-                }
-            })
-            .map_err(|e| MikoError::unexpected(format!("starting the controller reader: {e}")))?;
-        ready_rx
-            .recv()
-            .map_err(|_| MikoError::unexpected("the controller reader stopped"))?
-    }
-
-    fn button(b: gilrs::Button) -> Option<Button> {
-        use gilrs::Button as G;
-        Some(match b {
-            G::South => Button::South,
-            G::East => Button::East,
-            G::West => Button::West,
-            G::North => Button::North,
-            G::LeftTrigger => Button::LeftBumper,
-            G::RightTrigger => Button::RightBumper,
-            G::Select => Button::Back,
-            G::Start => Button::Start,
-            G::Mode => Button::Guide,
-            G::LeftThumb => Button::LeftStick,
-            G::RightThumb => Button::RightStick,
-            G::DPadUp => Button::Up,
-            G::DPadDown => Button::Down,
-            G::DPadLeft => Button::Left,
-            G::DPadRight => Button::Right,
-            _ => return None,
-        })
-    }
-
-    /// A `gilrs` event as the virtual controller's events. Analog triggers
-    /// come as `ButtonChanged`; some controllers send the D-pad as axes.
-    fn map(ev: EventType) -> Vec<PadEvent> {
-        use gilrs::Axis as A;
-        use gilrs::Button as G;
-        match ev {
-            EventType::ButtonChanged(G::LeftTrigger2, v, _) => {
-                vec![PadEvent::Axis(Axis::LeftTrigger, v)]
-            }
-            EventType::ButtonChanged(G::RightTrigger2, v, _) => {
-                vec![PadEvent::Axis(Axis::RightTrigger, v)]
-            }
-            EventType::ButtonPressed(b, _) => button(b)
-                .map(|b| vec![PadEvent::Button(b, true)])
-                .unwrap_or_default(),
-            EventType::ButtonReleased(b, _) => button(b)
-                .map(|b| vec![PadEvent::Button(b, false)])
-                .unwrap_or_default(),
-            EventType::AxisChanged(a, v, _) => match a {
-                A::LeftStickX => vec![PadEvent::Axis(Axis::LeftX, v)],
-                A::LeftStickY => vec![PadEvent::Axis(Axis::LeftY, v)],
-                A::RightStickX => vec![PadEvent::Axis(Axis::RightX, v)],
-                A::RightStickY => vec![PadEvent::Axis(Axis::RightY, v)],
-                A::DPadX => vec![
-                    PadEvent::Button(Button::Left, v < -0.5),
-                    PadEvent::Button(Button::Right, v > 0.5),
-                ],
-                A::DPadY => vec![
-                    PadEvent::Button(Button::Up, v > 0.5),
-                    PadEvent::Button(Button::Down, v < -0.5),
-                ],
-                _ => Vec::new(),
-            },
-            EventType::Disconnected => vec![PadEvent::Disconnected],
-            _ => Vec::new(),
-        }
+        _id: Option<usize>,
+        _device: String,
+        _tx: mpsc::Sender<PadEvent>,
+        _stop: Arc<AtomicBool>,
+    ) -> MikoResult<watch::Receiver<Controller>> {
+        Err(refuse())
     }
 }
 
@@ -229,6 +113,9 @@ mod tests {
             name: name.into(),
             vendor: None,
             product: None,
+            bound_device: None,
+            power: Power::Unknown,
+            controls: Vec::new(),
         }
     }
 

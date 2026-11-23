@@ -38,7 +38,7 @@ struct FolderSyncView: View {
                         Picker("", selection: $syncDirection) {
                             Text(t("双向同步（Mac 与设备互通）", "Bidirectional (Mac & device)")).tag("bidirectional")
                             Text(t("单向同步（Mac 到设备）", "One-way (Mac to device)")).tag("one_way")
-                        }
+                        }.wbDropdownStyle()
                         .labelsHidden()
                         .frame(width: 220)
                         .accessibilityLabel(t("同步方向", "Direction"))

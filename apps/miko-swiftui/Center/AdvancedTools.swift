@@ -360,7 +360,7 @@ struct AdvancedToolsView: View {
                 Picker("", selection: $charger) {
                     Text(t("未连接", "None")).tag("none"); Text("AC").tag("ac")
                     Text("USB").tag("usb"); Text(t("无线", "Wireless")).tag("wireless")
-                }.labelsHidden().frame(width: 180).accessibilityLabel(t("充电方式", "Charger"))
+                }.wbDropdownStyle().labelsHidden().frame(width: 180).accessibilityLabel(t("充电方式", "Charger"))
             }
         }
     }
@@ -440,7 +440,7 @@ struct AdvancedToolsView: View {
                             ForEach(["full","lte","hsdpa","umts","edge","gprs","gsm"], id: \.self) { value in
                                 Text(value == "full" ? t("不限速", "Unrestricted") : value.uppercased()).tag(value)
                             }
-                        }.labelsHidden().frame(width: 180).accessibilityLabel(t("网络速度", "Network speed"))
+                        }.wbDropdownStyle().labelsHidden().frame(width: 180).accessibilityLabel(t("网络速度", "Network speed"))
                     }
                 }
                 DeviceToolActions {
@@ -459,7 +459,7 @@ struct AdvancedToolsView: View {
                             Text(t("正常", "Normal")).tag("normal")
                             Text(t("延迟", "Slow")).tag("slow")
                             Text(t("失败", "Fail")).tag("fail")
-                        }.labelsHidden().frame(width: 180)
+                        }.wbDropdownStyle().labelsHidden().frame(width: 180)
                     }
                     if dnsMode == "slow" {
                         toolField(t("DNS 延迟（毫秒）", "DNS delay (ms)"), placeholder: "1–30000", text: $dnsDelay, width: 110, alignment: .trailing)
@@ -535,7 +535,7 @@ struct AdvancedToolsView: View {
                     LabeledContent(t("传感器", "Sensor")) {
                         Picker("", selection: $sensor) {
                             ForEach(["acceleration","gyroscope","magnetic_field","temperature","proximity","light","pressure","humidity"], id: \.self) { value in Text(sensorTitle(value)).tag(value) }
-                        }.labelsHidden().frame(width: 180).accessibilityLabel(t("传感器", "Sensor"))
+                        }.wbDropdownStyle().labelsHidden().frame(width: 180).accessibilityLabel(t("传感器", "Sensor"))
                     }
                 }
                 Text(sensorHint).font(.caption).foregroundStyle(WbColor.textSecondary)
@@ -565,7 +565,7 @@ struct AdvancedToolsView: View {
                 Picker("", selection: $logLevel) {
                     Text(t("全部", "All")).tag("")
                     ForEach(["V", "D", "I", "W", "E", "F"], id: \.self) { Text($0).tag($0) }
-                }.labelsHidden().frame(width: 180).disabled(followLog)
+                }.wbDropdownStyle().labelsHidden().frame(width: 180).disabled(followLog)
                     .accessibilityLabel(t("级别", "Level"))
             }
             Toggle(t("实时跟随", "Follow live"), isOn: $followLog)
@@ -702,7 +702,7 @@ struct AdvancedToolsView: View {
                 Toggle(t("指针位置", "Pointer location"),isOn:$pointer).disabled(!developerLoaded)
                 Toggle(t("布局边界", "Layout bounds"),isOn:$layoutBounds).disabled(!developerLoaded)
                 LabeledContent(t("动画倍率", "Animation scale")) {
-                    Picker("", selection: $animation) { ForEach([0.0,0.5,1.0,1.5,2.0,5.0,10.0], id: \.self) { Text(String($0)).tag($0) } }
+                    Picker("", selection: $animation) { ForEach([0.0,0.5,1.0,1.5,2.0,5.0,10.0], id: \.self) { Text(String($0)).tag($0) } }.wbDropdownStyle()
                         .labelsHidden().frame(width: 180).disabled(!developerLoaded)
                         .accessibilityLabel(t("动画倍率", "Animation scale"))
                 }

@@ -43,6 +43,7 @@ async fn gamepad_commands_check_the_device_and_report_no_controller() {
     ] {
         assert_eq!(spec(id)["longRunning"], false, "{id}");
     }
+    assert_eq!(spec("input.gamepad.capture")["longRunning"], true);
 
     c.call("device.create", json!({ "name": "P", "image": "35" }))
         .await
@@ -67,6 +68,11 @@ async fn gamepad_commands_check_the_device_and_report_no_controller() {
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::NotFound, "{}", e.message);
     assert!(e.message.contains("isn't running"), "{}", e.message);
+    let e = c
+        .run("input.gamepad.capture", json!({"device":"P"}), |_| {})
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotFound);
     let v = c
         .call("input.gamepad.get", json!({ "device": "P" }))
         .await
@@ -86,6 +92,16 @@ async fn gamepad_commands_check_the_device_and_report_no_controller() {
         .run(
             "input.gamepad.connect",
             json!({ "device": "P", "controller": "first" }),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Usage, "{}", e.message);
+
+    let e = c
+        .run(
+            "input.gamepad.connect",
+            json!({ "device": "P", "calibration": {"left": {"deadzone": 1.0}} }),
             |_| {},
         )
         .await

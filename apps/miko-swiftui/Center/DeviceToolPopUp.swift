@@ -12,6 +12,7 @@ struct DeviceToolPopUp: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(selection: $selection) }
     func makeNSView(context: Context) -> NSPopUpButton {
         let control = NSPopUpButton(frame: .zero, pullsDown: false)
+        control.isBordered = false
         control.target = context.coordinator
         control.action = #selector(Coordinator.changed(_:))
         control.setContentHuggingPriority(.defaultLow, for: .horizontal)

@@ -112,8 +112,7 @@ struct ImageManagementView: View {
         }
         .padding(15)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(WbColor.raised.opacity(0.28), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(WbColor.borderSubtle))
+        .modifier(WbCardMaterial())
     }
 
     var body: some View {

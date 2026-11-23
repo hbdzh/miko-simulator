@@ -93,6 +93,13 @@ pub type ProgressFn = Arc<dyn Fn(Option<f32>, &str) + Send + Sync>;
 /// Reports job progress with the bytes done and expected of a download.
 pub type BytesFn = Arc<dyn Fn(Option<f32>, &str, u64, u64) + Send + Sync>;
 
+/// A job may temporarily release input after confirming all injected input is
+/// gone, then request it again without preempting another owner.
+pub trait InputLease: Send + Sync {
+    fn suspend(&self) -> MikoResult<()>;
+    fn resume(&self) -> MikoResult<()>;
+}
+
 /// What a provider gets for each call.
 #[derive(Clone)]
 pub struct CallCtx {
@@ -103,6 +110,7 @@ pub struct CallCtx {
     /// The client connection the call came on (`None` for the daemon's own
     /// calls). Pool leases are tied to it (D42).
     pub connection: Option<u64>,
+    pub input_lease: Option<Arc<dyn InputLease>>,
 }
 
 impl std::fmt::Debug for CallCtx {
@@ -121,6 +129,7 @@ impl CallCtx {
             bytes: Arc::new(|_, _, _, _| {}),
             cancel: Cancel::new(),
             connection: None,
+            input_lease: None,
         }
     }
 
@@ -145,6 +154,9 @@ impl CallCtx {
 #[async_trait]
 pub trait DaemonContext: Send + Sync {
     fn paths(&self) -> &MikoPaths;
+
+    /// Whether an RPC connection is still present, for connection-scoped streams.
+    fn connection_alive(&self, connection: u64) -> bool;
 
     /// The `adb` binary of the SDK in use.
     fn adb_path(&self) -> MikoResult<PathBuf>;

@@ -5,6 +5,10 @@ cd "$root"
 out="$root/target/swiftui-tests"
 mkdir -p "$out/module-cache"
 swiftc -module-cache-path "$out/module-cache" \
+  apps/miko-swiftui/Sources/GamepadState.swift \
+  apps/miko-swiftui/Tests/GamepadState/main.swift -o "$out/gamepad-state-tests"
+"$out/gamepad-state-tests"
+swiftc -module-cache-path "$out/module-cache" \
   apps/miko-swiftui/Sources/PacketLoss.swift \
   apps/miko-swiftui/Tests/PacketLoss/main.swift -o "$out/packet-loss-tests"
 "$out/packet-loss-tests"

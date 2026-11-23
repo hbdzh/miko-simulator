@@ -14,23 +14,7 @@ struct AvailableImage: Decodable, Identifiable {
     var id: String { "\(api):\(tag):\(abi)" }
     var package: String { "system-images;android-\(api);\(tag);\(abi)" }
 }
-struct OnboardingCardMaterial: ViewModifier {
-    @Environment(\.colorScheme) private var colorScheme
-
-    func body(content: Content) -> some View {
-        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
-        let dark = colorScheme == .dark
-        content.foregroundStyle(WbColor.textPrimary)
-            // The window supplies the blur; the translucent tint preserves
-            // its color instead of adding an opaque material on top.
-            .background {
-                shape.fill(Color.white.opacity(dark ? 0.08 : 0.36))
-                    .shadow(color: .black.opacity(dark ? 0.10 : 0.08), radius: 12, y: 5)
-                    .allowsHitTesting(false)
-            }
-            .overlay(shape.strokeBorder(dark ? Color.white.opacity(0.16) : Color.black.opacity(0.12)).allowsHitTesting(false))
-    }
-}
+typealias OnboardingCardMaterial = WbCardMaterial
 
 struct CustomResolutionView: View {
     let language: Int
@@ -867,7 +851,7 @@ struct NewDeviceView: View {
                         Text("API \(image.api) · \(Device.imageTagLabel(image.tag)) · \(image.abi)").tag(image.id)
                     }
                 }
-                .pickerStyle(.menu).buttonStyle(.borderless).controlSize(.regular)
+                .wbDropdownStyle()
                 .labelsHidden().frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityLabel(model.text("安装组件", "Components to install"))
                 .disabled(environmentBusy)
@@ -992,7 +976,7 @@ struct NewDeviceView: View {
                                     Text("Android API \(item.api) · \(Device.imageTagLabel(item.tag)) · \(item.abi)").tag(item.id)
                                 }
                             }
-                            .pickerStyle(.menu).buttonStyle(.borderless).labelsHidden()
+                            .wbDropdownStyle().labelsHidden()
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .disabled(saving)
                             .accessibilityLabel(model.text("系统镜像", "System image"))
@@ -1084,46 +1068,17 @@ struct NewDeviceView: View {
         }
     }
 
-    @ViewBuilder private var rootModeControl: some View {
-        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
-        let segments = HStack(spacing: 0) {
-            rootModeButton(model.text("关闭", "Off"), value: "none")
-            rootModeButton("Shell Root", value: "adb")
-            rootModeButton(model.text("完整 Root", "Full Root"), value: "magisk")
-        }
-        .padding(3)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(model.text("Root 模式", "Root mode"))
-        .onMoveCommand { direction in
-            let values = ["none", "adb", "magisk"]
-            guard !saving, let index = values.firstIndex(of: root) else { return }
-            switch direction {
-            case .left: root = values[max(0, index - 1)]
-            case .right: root = values[min(values.count - 1, index + 1)]
-            default: break
-            }
-        }
-        if #available(macOS 26.0, *) {
-            segments.glassEffect(.regular, in: shape)
-        } else {
-            segments.background(.regularMaterial, in: shape)
-        }
-    }
-
-    private func rootModeButton(_ title: String, value: String) -> some View {
-        let selected = root == value
-        return Button { root = value } label: {
-            Text(title).font(.system(size: 12, weight: .medium)).lineLimit(1)
-                .foregroundStyle(selected ? Color(nsColor: .alternateSelectedControlTextColor) : WbColor.textPrimary)
-                .frame(maxWidth: .infinity, minHeight: 28)
-                .background(selected ? Color(nsColor: .controlAccentColor).opacity(0.88) : .clear,
-                            in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain).disabled(saving)
-        .help(title)
-        .accessibilityValue(selected ? model.text("已选择", "Selected") : "")
-        .accessibilityAddTraits(selected ? .isSelected : [])
+    private var rootModeControl: some View {
+        WbSegmentedControl(
+            label: model.text("Root 模式", "Root mode"),
+            selectedLabel: model.text("已选择", "Selected"),
+            selection: $root,
+            options: [
+                .init(value: "none", title: model.text("关闭", "Off")),
+                .init(value: "adb", title: "Shell Root"),
+                .init(value: "magisk", title: model.text("完整 Root", "Full Root"))
+            ]
+        ).disabled(saving)
     }
 
     private var rootExplanation: String {
@@ -1172,11 +1127,12 @@ struct NewDeviceView: View {
             }
             .frame(maxWidth: .infinity, minHeight: 65, alignment: .topLeading)
             .padding(9)
-            .background(selected ? WbColor.accentContainer.opacity(0.65) : Color.primary.opacity(0.025),
-                        in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(selected ? WbColor.accentText.opacity(0.65) : WbColor.borderSubtle))
-            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .modifier(WbCardMaterial())
+            .background(selected ? WbColor.accentContainer.opacity(0.65) : .clear,
+                        in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(selected ? WbColor.accentText.opacity(0.65) : .clear))
+            .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         }
         .buttonStyle(.plain).disabled(saving)
         .accessibilityLabel(title)

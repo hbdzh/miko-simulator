@@ -141,10 +141,10 @@ final class DeviceSheetPanelController: NSWindowController, NSWindowDelegate {
     let kind: CenterSheet
     let deviceID: String?
 
-    init(model: CenterModel, kind: CenterSheet, parent: NSWindow) {
+    init(model: CenterModel, kind: CenterSheet, parent: NSWindow, editDetails: Details? = nil) {
         self.model = model
         self.kind = kind
-        self.deviceID = model.selected
+        self.deviceID = editDetails?.device.id ?? model.selected
         let size: NSSize
         switch kind {
         case .newDevice: size = NSSize(width: 650, height: 580)
@@ -176,7 +176,7 @@ final class DeviceSheetPanelController: NSWindowController, NSWindowDelegate {
                 content = AnyView(FolderSyncView(model: model, device: device, onPanelClose: close))
             } else { content = AnyView(EmptyView()) }
         case .edit:
-            if let details = model.details {
+            if let details = editDetails ?? model.details {
                 content = AnyView(EditDeviceView(model: model, details: details, onPanelClose: close))
             } else { content = AnyView(EmptyView()) }
         default: content = AnyView(EmptyView())

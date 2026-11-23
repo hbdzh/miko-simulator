@@ -42,10 +42,138 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
     // MARK: Operation recordings (docs/player-scripts.md)
     enum ScriptRecordingState: Equatable { case idle, recording, paused }
     enum ScriptPlaybackState: Equatable { case idle, playing, paused }
-    enum GamepadState: Equatable { case disconnected, connecting, connected }
-
     @Published var gamepadState: GamepadState = .disconnected
+    @Published var gamepadMode: GamepadInputMode = .native
+    @Published var gamepadRecovering = false
+    @Published var gamepads: [GamepadController] = []
+    @Published var gamepadListError: String?
+    var gamepadRefreshPending = false
+    var onRefreshGamepads: (() -> Void)?
+    var onRefreshGamepadStatus: (() -> Void)?
+    var gamepadStatusPending = false
+    var gamepadPanelOpen = false
+    private var gamepadStatusTimer: Timer?
+    var onSelectGamepad: ((Int) -> Void)?
     var onToggleGamepad: (() -> Void)?
+    var onStopGamepad: (() -> Void)?
+    var onGamepadEvent: (([String: Any]) -> Void)?
+    var onGamepadReset: (() -> Void)?
+    /// Optional observer used by the player lifecycle regression fixture.
+    var inputObserver: (([String: Any]) -> Void)?
+    private var gamepadAccepting = false
+    var gamepadManualTakeover = false
+    var gamepadExpectedSession: String?
+    private var gamepadSequence: UInt64 = 0
+    private var gamepadLastEvent: TimeInterval?
+    private var gamepadLastStatusPoll: TimeInterval?
+
+    private func resetGamepadEvents() {
+        gamepadSequence = 0
+        gamepadLastEvent = nil
+        onGamepadReset?()
+    }
+
+    func beginGamepadCapture() -> String {
+        resetGamepadEvents()
+        onReleasePlayerInput?()
+        gamepadAccepting = true
+        gamepadManualTakeover = false
+        let session = UUID().uuidString.lowercased()
+        gamepadExpectedSession = session
+        gamepadLastEvent = ProcessInfo.processInfo.systemUptime
+        return session
+    }
+
+    @discardableResult func stopGamepadCapture() -> Bool {
+        guard gamepadAccepting || gamepadExpectedSession != nil else { return false }
+        stopAcceptingGamepadEvents()
+        onStopGamepad?()
+        return true
+    }
+
+    func finishGamepadCapture() {
+        stopAcceptingGamepadEvents()
+        gamepadExpectedSession = nil
+    }
+
+    private func stopAcceptingGamepadEvents() {
+        guard gamepadAccepting else { return }
+        gamepadAccepting = false
+        resetGamepadEvents()
+        onReleasePlayerInput?()
+    }
+
+    func takeOverGamepadMapping() {
+        guard gamepadMode == .touch, gamepadAccepting else { return }
+        gamepadManualTakeover = true
+        stopGamepadCapture()
+        onStatus?(t("手柄已断开：手动输入已接管", "Controller disconnected: manual input took over", language))
+    }
+
+    private func releaseInputAfterFailure() {
+        let captureWillRelease = gamepadMode == .touch && gamepadAccepting
+        if gamepadMode == .touch { stopGamepadCapture() }
+        if !captureWillRelease { onReleasePlayerInput?() }
+    }
+
+    func handleInputFailure(_ detail: String) {
+        releaseInputAfterFailure()
+        let message = t("输入失败，已停止发送并尝试释放触点：", "Input failed; sending stopped and release was attempted: ", language) + detail
+        if syncRole == .follower { onSyncInputFailure?(message) }
+        else if syncRole == .leader { onSyncBusy?(message) }
+        onStatus?(message)
+        send(["type": "input_reset"])
+    }
+
+    func receiveGamepadEvent(_ data: [String: Any]) {
+        guard gamepadMode == .touch, gamepadAccepting, let session = data["session"] as? String,
+              let sequenceNumber = data["sequence"] as? NSNumber,
+              let event = data["event"] as? [String: Any] else { return }
+        let sequence = sequenceNumber.uint64Value
+        guard session == gamepadExpectedSession else { return }
+        guard sequence == gamepadSequence + 1 else {
+            stopGamepadCapture()
+            return
+        }
+        gamepadSequence = sequence
+        gamepadLastEvent = ProcessInfo.processInfo.systemUptime
+        if event["kind"] as? String == "ended" {
+            gamepadState = .disconnected
+            gamepadRecovering = event["reason"] as? String == "unplugged"
+            if gamepadRecovering {
+                gamepadLastEvent = nil
+                onGamepadReset?()
+                onReleasePlayerInput?()
+            } else {
+                stopAcceptingGamepadEvents()
+            }
+            return
+        }
+        onGamepadEvent?(event)
+    }
+
+    func startGamepadStatusPolling() {
+        gamepadStatusTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            if self.gamepadMode == .touch, let last = self.gamepadLastEvent, now - last > 1 {
+                self.stopGamepadCapture()
+            }
+            if self.gamepadLastStatusPoll.map({ now - $0 >= 1 }) ?? true {
+                self.gamepadLastStatusPoll = now
+                self.onRefreshGamepadStatus?()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        gamepadStatusTimer = timer
+    }
+
+    func stopGamepadStatusPolling() {
+        gamepadStatusTimer?.invalidate()
+        gamepadStatusTimer = nil
+        gamepadLastStatusPoll = nil
+    }
 
     /// Scripts listed by the bridge (`script_list` / `saved` notifications).
     @Published private(set) var scripts: [PlayerScriptSummary] = []
@@ -75,9 +203,11 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
     @Published var syncLockedHintVisible: Bool = false
     var onSyncEvent: ((Int, [String: Any]) -> Void)?
     var onSyncBusy: ((String) -> Void)?
+    var onSyncInputFailure: ((String) -> Void)?
     var onSyncTakeOver: (() -> Void)?
     var onOpenSyncPanel: (() -> Void)?
     var onSyncBridgeLost: (() -> Void)?
+    var onSyncGamepadFeedback: ((String, Bool) -> Void)?
     var onSyncLeaderRelease: (() -> Void)?
     var onSyncDisplaySizeChanged: ((Int, Int) -> Void)?
     private var syncLockedHintWorkItem: DispatchWorkItem?
@@ -89,6 +219,7 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
 
     var onFrame: ((CGImage, Int) -> Void)?
     var onReleasePlayerInput: (() -> Void)?
+    var onForegroundChanged: (() -> Void)?
     private(set) var lastFrame: CGImage?
     var onStatus: ((String) -> Void)?
     var onFrameSize: ((Int, Int) -> Void)?
@@ -269,7 +400,7 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
         input = nil
         frames = nil
         diagnostics = nil
-        onReleasePlayerInput?()
+        releaseInputAfterFailure()
         connectionEnded = true
         linkState = PlayerExitClassifier.classify(diagnostic: lastDiagnostic)
         let scriptInterrupted = scriptRecording != .idle || scriptPlayback != .idle
@@ -403,11 +534,24 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
     }
 
     func sendSyncInput(seq: Int, event: [String: Any]) {
+        if event["type"] as? String == "gamepad" {
+            var payload = event
+            payload["type"] = "sync_gamepad"
+            send(payload)
+            return
+        }
         send([
             "type": "sync_input",
             "seq": seq,
             "event": event,
         ])
+    }
+
+    func sendNativeGamepadLeader(_ data: [String: Any]) {
+        var payload = data
+        payload.removeValue(forKey: "device")
+        payload["type"] = "sync_gamepad_leader"
+        send(payload)
     }
 
     func sendSyncRelease() {
@@ -426,8 +570,10 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
 
     func send(_ message: [String: Any]) {
         if let type = message["type"] as? String, PlayerInputOwnership.releasesBeforeToolbarAction(type) {
-            onReleasePlayerInput?()
+            if gamepadMode == .touch && gamepadAccepting { takeOverGamepadMapping() }
+            else { onReleasePlayerInput?() }
         }
+        inputObserver?(message)
         guard JSONSerialization.isValidJSONObject(message),
               let data = try? JSONSerialization.data(withJSONObject: message) else { return }
         inputQueue.async { [weak self] in
@@ -780,7 +926,8 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
                let package = result["package"] as? String {
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.generation == token else { return }
-                    self.mapping.updateForeground(package) { self.onReleasePlayerInput?() }
+                    if self.mapping.foregroundPackage != package { self.onForegroundChanged?() }
+                    self.mapping.updateForeground(package, isLauncher: result["is_launcher"] as? Bool) { self.onReleasePlayerInput?() }
                 }
             }
         } else if line.hasPrefix("MIKO_MAPPING_PATH:") {
@@ -895,11 +1042,7 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
                   result["state"] as? String == "failed" else { return }
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.generation == token else { return }
-                self.onReleasePlayerInput?()
-                let message = t("输入失败，已停止发送并尝试释放触点：", "Input failed; sending stopped and release was attempted: ", self.language) + (result["message"] as? String ?? "")
-                if self.syncRole != .off { self.onSyncBusy?(message) }
-                self.onStatus?(message)
-                self.send(["type": "input_reset"])
+                self.handleInputFailure(result["message"] as? String ?? "")
             }
         } else if line.hasPrefix("MIKO_SCRIPT:") {
             let payload = String(line.dropFirst("MIKO_SCRIPT:".count))
@@ -921,6 +1064,16 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
                 self.onSyncEvent?(seq, event)
                 _ = now
             }
+        } else if line.hasPrefix("MIKO_GAMEPAD_FEEDBACK:") {
+            let payload = String(line.dropFirst("MIKO_GAMEPAD_FEEDBACK:".count))
+            guard let data = payload.data(using: .utf8),
+                  let result = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let session = result["session"] as? String,
+                  let vibrating = result["vibrating"] as? Bool else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.generation == token else { return }
+                self.onSyncGamepadFeedback?(session, vibrating)
+            }
         } else if line.hasPrefix("MIKO_SYNC_STATUS:") {
             let payload = String(line.dropFirst("MIKO_SYNC_STATUS:".count))
             guard let data = payload.data(using: .utf8),
@@ -937,6 +1090,9 @@ final class PlayerTransport: ObservableObject, SyncBridgeTarget {
                     self.onSyncBusy?(message)
                 case "release":
                     self.onSyncLeaderRelease?()
+                case "gamepad_error":
+                    self.onSyncInputFailure?(message)
+                    self.onStatus?(message)
                 default:
                     self.onSyncBusy?(message)
                 }

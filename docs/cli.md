@@ -40,7 +40,7 @@ miko --json device start Phone --timeout 300 || exit $?
 | `flash <name> <zip>` | 在完整 Root 设备安装 Magisk/Zygisk 模块，或把其他支持的 ZIP 复制到 Download；拒绝 Recovery、Riru 和分区镜像包。 |
 | `sync start <device> <folder> [remote] [--bidirectional]`, `sync list [device]`, `sync resolve <id> <path> --keep local\|remote\|both`, `sync stop <id>` | 单向或双向文件夹同步。单向同步主机修改和删除，保留仅存在于设备的文件；`--bidirectional` 双向同步修改和删除，并保留冲突以供 `sync resolve` 处理。启动命令会在首次复制完成前返回。 |
 | `input-sync start --leader <dev> --follower <dev>… [--adaptation stretch\|letterbox] [--no-keyboard] [--no-text] [--no-tool-keys] [--unlock-followers] [--jitter-ms N]`, `input-sync stop`, `input-sync status`, `input-sync add\|remove\|leader <dev>` | 将主设备的播放器输入镜像到运行中的跟随设备（D45，[sync.md](sync.md)）。CLI 管理会话；主设备播放器窗口打开时才传送输入。 |
-| `gamepad list`, `gamepad connect <device> [--controller id]`, `gamepad disconnect <device>` | 将 Mac 游戏手柄转发至运行中的模拟器；连接命令返回任务 ID。 |
+| `gamepad list`, `gamepad connect <device> [--controller id]`, `gamepad disconnect <device>` | 将 Mac 游戏手柄转发至运行中的模拟器；列表展示实时控件和绑定目标，手柄编号仅在当前 daemon 输入服务生命周期内有效。连接命令返回任务 ID。 |
 | `identity <device> [--android-id ID]` | 读取 Android ID 和 IMEI，或通过 Root 设置 16 位十六进制 Android ID；设置会重启 Android 框架。IMEI 只读。 |
 | `image list [--installed]`, `image install <img> [--accept-licenses]` | 列出或安装系统镜像。 |
 | `profile list` | 内置硬件配置（D24）。`agent-lean`（720×1280、2 GB、2 核、不启用音频或相机）约占用 4 GB 主机内存，而非约 7.6 GB。 |
@@ -62,6 +62,8 @@ miko --json device start Phone --timeout 300 || exit $?
 | `daemon [run]`, `daemon stop`, `daemon status` | 前台运行 daemon、停止 daemon（设备保持运行）或查看其状态。 |
 | `shell [script]` | 交互式 shell 或执行命令脚本，见 [Shell](#shell)。 |
 | `completions <shell>` | 输出 shell 补全。 |
+
+物理手柄短暂断开后，已确认释放的转发会等待唯一的名称、VID 和 PID 匹配，并在设备输入未被占用时自动恢复；同型号手柄导致身份不明确、设备停止或输入已被占用时不会自动恢复。可用 `gamepad disconnect` 取消等待。正在转发时，播放器中的实时测试也会向模拟器发送输入。
 
 全局参数：`--json`、`-q/--quiet`（不显示进度）、`--restart-stale`（或 `MIKO_RESTART_STALE=1`）。
 

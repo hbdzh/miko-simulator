@@ -10,6 +10,7 @@ struct Owner {
     token: Uuid,
     job: bool,
     preemptible: bool,
+    gamepad_sync: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +26,7 @@ pub(crate) struct InputOwnership {
     abandoned: HashSet<Uuid>,
     waiters: HashMap<Uuid, Waiter>,
     job_cancellations: HashMap<Uuid, Cancel>,
+    gamepad_captures: HashMap<Uuid, usize>,
 }
 
 impl InputOwnership {
@@ -36,10 +38,14 @@ impl InputOwnership {
             abandoned: HashSet::new(),
             waiters: HashMap::new(),
             job_cancellations: HashMap::new(),
+            gamepad_captures: HashMap::new(),
         }
     }
     pub fn connected(&mut self, connection: u64) {
         self.connections.insert(connection);
+    }
+    pub fn connection_alive(&self, connection: u64) -> bool {
+        self.connections.contains(&connection)
     }
     pub fn disconnected(&mut self, connection: u64) {
         self.connections.remove(&connection);
@@ -63,7 +69,53 @@ impl InputOwnership {
         if self.waiters.contains_key(&device) {
             return Err(MikoError::busy("device input handoff is in progress"));
         }
-        self.acquire_available(device, connection, preemptible)
+        self.acquire_available(device, connection, preemptible, false, false)
+    }
+
+    pub fn acquire_gamepad_sync(&mut self, device: Uuid, connection: u64) -> MikoResult<Uuid> {
+        if self.gamepad_captures.contains_key(&device) {
+            return Err(MikoError::busy(
+                "a controller is already mapped to this device",
+            ));
+        }
+        if self.waiters.contains_key(&device) {
+            return Err(MikoError::busy("device input handoff is in progress"));
+        }
+        self.acquire_available(device, connection, false, false, true)
+    }
+
+    pub fn begin_gamepad_capture(&mut self, device: Uuid) -> MikoResult<()> {
+        if self
+            .owners
+            .get(&device)
+            .is_some_and(|owner| owner.gamepad_sync)
+        {
+            return Err(MikoError::busy(
+                "this device is receiving native gamepad sync",
+            ));
+        }
+        *self.gamepad_captures.entry(device).or_default() += 1;
+        Ok(())
+    }
+
+    pub fn end_gamepad_capture(&mut self, device: Uuid) {
+        if let std::collections::hash_map::Entry::Occupied(mut capture) =
+            self.gamepad_captures.entry(device)
+        {
+            *capture.get_mut() -= 1;
+            if *capture.get() == 0 {
+                capture.remove();
+            }
+        }
+    }
+
+    /// A previously pinned daemon job can resume after its client disconnects.
+    /// This is internal to the retained job and still respects waiters and owners.
+    pub fn reacquire_job(&mut self, device: Uuid, connection: u64) -> MikoResult<Uuid> {
+        if self.waiters.contains_key(&device) {
+            return Err(MikoError::busy("device input handoff is in progress"));
+        }
+        self.acquire_available(device, connection, true, true, false)
     }
 
     fn acquire_available(
@@ -71,8 +123,10 @@ impl InputOwnership {
         device: Uuid,
         connection: u64,
         preemptible: bool,
+        pinned_job: bool,
+        gamepad_sync: bool,
     ) -> MikoResult<Uuid> {
-        if !self.connections.contains(&connection) {
+        if !pinned_job && !self.connections.contains(&connection) {
             return Err(MikoError::busy("input client disconnected"));
         }
         if self.abandoned.contains(&device) {
@@ -112,6 +166,7 @@ impl InputOwnership {
                 token,
                 job: false,
                 preemptible,
+                gamepad_sync,
             },
         );
         Ok(token)
@@ -165,7 +220,8 @@ impl InputOwnership {
             return Ok(None);
         }
         self.waiters.remove(&device);
-        self.acquire_available(device, connection, false).map(Some)
+        self.acquire_available(device, connection, false, false, false)
+            .map(Some)
     }
 
     pub fn cancel_takeover(&mut self, device: Uuid, connection: u64, request: Uuid) {
@@ -250,6 +306,24 @@ impl InputOwnership {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pinned_job_can_reacquire_after_its_client_disconnects() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut input = InputOwnership::new(dir.path().to_owned());
+        let device = Uuid::new_v4();
+        input.connected(1);
+        let token = input.acquire(device, 1, true).unwrap();
+        input.pin_job(device, 1, token).unwrap();
+        input.release(device, 1, token).unwrap();
+        input.disconnected(1);
+        assert!(input.acquire(device, 1, true).is_err());
+        let token = input.reacquire_job(device, 1).unwrap();
+        input.pin_job(device, 1, token).unwrap();
+        input.connected(2);
+        assert!(input.acquire(device, 2, true).is_err());
+        input.release(device, 1, token).unwrap();
+    }
     #[test]
     fn excludes_conflicts_and_fences_abandoned_owners() {
         let dir = tempfile::tempdir().unwrap();

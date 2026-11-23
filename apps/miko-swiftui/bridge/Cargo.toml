@@ -8,6 +8,8 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 miko-automation.workspace = true
+miko-adb.workspace = true
+miko-widgets.workspace = true
 miko-client.workspace = true
 miko-core.workspace = true
 miko-proto.workspace = true

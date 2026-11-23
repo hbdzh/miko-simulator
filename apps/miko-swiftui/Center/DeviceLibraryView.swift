@@ -460,8 +460,7 @@ private struct OverviewInfoCard<Content: View>: View {
         }
         .padding(compact ? 12 : 16)
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(WbColor.borderSubtle))
+        .modifier(WbCardMaterial())
     }
 }
 

@@ -125,6 +125,8 @@ pub enum PadEvent {
     Axis(Axis, f32),
     /// The controller went away (unplugged, switched off).
     Disconnected,
+    /// Another identical model was already present at disconnection.
+    DisconnectedAmbiguous,
 }
 
 /// The controller's whole state, as one report carries it.
@@ -169,7 +171,7 @@ impl Pad {
                 Axis::LeftTrigger => self.triggers[0] = trigger(v),
                 Axis::RightTrigger => self.triggers[1] = trigger(v),
             },
-            PadEvent::Disconnected => {}
+            PadEvent::Disconnected | PadEvent::DisconnectedAmbiguous => {}
         }
         *self != before
     }

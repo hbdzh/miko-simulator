@@ -97,6 +97,9 @@
 | `device.hook_failed` | `{device, provider, error}`：provider 的启动后钩子失败 |
 | `file.sync.started`、`file.sync.progress`、`file.sync.synced`、`file.sync.conflict`、`file.sync.error`、`file.sync.stopped` | 文件夹同步状态、冲突和进度 |
 | `sync.state`、`sync.follower_error` | `{session, reason?}`：完整同步会话，结束时为 `null`，`reason` 为 `stopped`、`the leader stopped` 或 `no follower is left`；或 `{device, name, message}`：跟随端失败，见[同步指南](sync.md) |
+| `input.gamepad.event` | `{device, session, sequence, event}`：`event.kind` 为 `button`、`axis`、`heartbeat` 或 `ended`。按键事件含 `control`、`down`，轴事件含 `control`、`value`，结束事件含 `reason`。断连恢复时 `ended` 后可能在同一会话继续以递增序号发送事件，等待期间暂停心跳。接收方必须在序号不连续、`events.lagged`、心跳中断或收到 `ended` 时释放所有由此产生的输入。 |
+| `input.gamepad.native` | `{device, session, sequence, report}`：原生直通已经写入主控设备的 13 字节 Xbox 360 HID 报告（2 字节按键位、4 个小端 16 位摇杆轴、2 字节扳机、1 字节方向帽）；静止时定期重发当前状态。结束事件为 `{device, session, sequence, ended: true}`。消费者必须在丢失事件、超时或结束时释放虚拟手柄。 |
+| `input.gamepad.feedback` | `{device, controller, session, vibrating}`：Android `uinput` 虚拟手柄返回的震动启停状态；实际震动取决于物理手柄和系统支持，输出通道结束时发送停止状态。 |
 | `pool.leased`、`pool.released` | `{lease, device, base?}`：设备池克隆已租用或释放 |
 | `job.started` | `{job, kind, device}` |
 | `job.progress` | `{job, progress, message}` |
@@ -765,6 +768,18 @@ Acquire exclusive device input for this connection
 | `device` | string | yes | Device name or id. |
 | `preemptible` | boolean |  | Owner cooperates with a manual takeover request. |
 | `takeover` | boolean |  | Request the current preemptible owner to stop and release first. |
+| `gamepad_sync` | boolean |  | Reserve input for a native gamepad sync follower, excluding touch capture. |
+
+#### `input.gamepad.capture`
+
+Capture controller events for touch mapping until input.gamepad.disconnect · long-running (job)
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `device` | string | yes | Device name or id. |
+| `controller` | integer |  | Which controller: an `id` from `input.gamepad.list`. Default: the first one connected. |
+| `calibration` | Calibration |  | Optional analog calibration; omitted settings preserve the raw input. |
+| `session` | uuid |  | Optional client-generated capture session id. |
 
 #### `input.gamepad.connect`
 
@@ -774,6 +789,8 @@ Forward a game controller on this computer to the device until input.gamepad.dis
 |---|---|---|---|
 | `device` | string | yes | Device name or id. |
 | `controller` | integer |  | Which controller: an `id` from `input.gamepad.list`. Default: the first one connected. |
+| `calibration` | Calibration |  | Optional analog calibration; omitted settings preserve the raw input. |
+| `session` | uuid |  | Optional client-generated capture session id. |
 
 #### `input.gamepad.disconnect`
 
@@ -782,6 +799,18 @@ Stop forwarding the game controller to the device
 | Param | Type | Required | Description |
 |---|---|---|---|
 | `device` | string | yes | Device name or id. |
+| `session` | uuid |  | Stop only this capture session; omit to stop the current binding. |
+
+#### `input.gamepad.feedback`
+
+Relay vibration from a synchronized device to the bound controller
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `device` | string | yes |  |
+| `session` | uuid | yes |  |
+| `source` | uuid | yes |  |
+| `vibrating` | boolean | yes |  |
 
 #### `input.gamepad.get`
 
@@ -1364,6 +1393,15 @@ Snapshot warnings report low resources, incomplete or unclean sessions, and `sto
 
 | Version | Change |
 |---|---|
+| 0.1 (additive) | `input.acquire` 可用 `gamepad_sync: true` 为原生同步跟随端取得非抢占租约。该租约与同一设备的 `input.gamepad.capture` 互斥，任一方已预留时，另一方返回 `busy`。 |
+| 0.1 (additive) | 新增 `input.gamepad.capture`，独占捕获一只物理手柄并发布带会话 ID、连续序号和心跳的 `input.gamepad.event`。它不注入触控，也不获取设备输入所有权；消费者必须自行遵守输入仲裁并在事件丢失时释放输入。`input.gamepad.disconnect` 的可选 `session` 可限制停止的捕获会话；该设备不能同时启用原生手柄转发。 |
+| 0.1 (additive) | 原生直通增加 `input.gamepad.native` 状态事件，供播放器同步链转发到各跟随设备的虚拟手柄。 |
+| 0.1 (additive) | 原生直通优先使用 `uinput`，并将虚拟设备的震动启停发布为 `input.gamepad.feedback`；增加同名命令将同步跟随设备的反馈交给绑定手柄，多个设备的震动按来源合并。没有 `uinput` 时使用 `hid`。 |
+| 0.1 (additive) | `input.gamepad.list` 增加 `power` 状态：`unknown`、`wired`、`charged`、`available`、`charging` 或 `discharging`；后三者包含 `percent`。macOS 从 GameController 获取电量，系统未提供时返回 `unknown`。 |
+| 0.1 (additive) | `input.gamepad.connect` 增加可选 `calibration`；手柄恢复时沿用本次连接的调校。摇杆死区范围为 0～0.95，灵敏度为 0.1～5，扳机阈值为 0～0.95；不合法的数值返回 `usage`。 |
+| 0.1 (additive) | 手柄物理断连且虚拟设备退出确认后，转发任务释放设备输入所有权并等待唯一的名称、VID、PID 匹配；恢复前重新检查设备并按现有仲裁非抢占地取得所有权。等待期间 `input.gamepad.get` 可返回 `recovering: true`，任务进度依次报告 `miko.gamepad.disconnected`、`miko.gamepad.reconnecting` 和 `miko.gamepad.ready`。`input.gamepad.disconnect` 可取消等待；其他手柄可替代等待恢复的绑定。存在同型号歧义、手柄已被绑定或输入不可用时停止恢复。主机输入流异常以 `input_failed` 结束，歧义断连以 `identity_ambiguous` 结束。 |
+| 0.1 (additive) | `input.gamepad.list` 的手柄项增加可选 `bound_device` 和 `controls`，用于展示绑定目标及实时控件值。手柄枚举和转发共用同一输入服务；已被占用的手柄返回 `busy`。 |
+| 0.1 (fix) | 原生直通时，`input.gamepad.get` 的 `connected` 仅在 Android 输入设备已注册且初始中立报告已写入后为 true；`input.gamepad.connect` 就绪时报告进度消息 `miko.gamepad.ready`。断连或取消时先尝试发送中立报告，再关闭虚拟设备并等待退出确认。 |
 | 0.1 (additive) | `host.budget` 的设备项增加可选 `cpu_percent`：模拟器进程树最近一次 CPU 采样的整数百分比，100 表示一个逻辑核心；不可测量时省略。采样周期约 30 秒。 |
 | 0.1 (additive) | 新增 `device.stop_task` 和 `file.install_task`，供批量操作请求取消：停止在快照保存完成后、最终关机前检查取消；安装在暂存传输期间可取消，进入 Android 安装提交后报告实际结果，连接中断时报告结果不明并保留暂存文件路径。临时文件清理失败作为失败报告。原有 `device.stop`、`file.install` 接口保持不变。 |
 | 0.1 (additive) | 新增 `device.clone_task`，通过任务接口运行可取消的普通克隆；取消时清理未完成的目标，清理失败报告为任务失败。`device.clone` 保持原有同步结果和快照克隆行为。 |

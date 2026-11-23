@@ -33,11 +33,17 @@ enum MappingKey {
         return (33...126).contains(b) && !(97...122).contains(b)
     }
 
+    static func isGamepad(_ key: String) -> Bool {
+        ["PAD_SOUTH", "PAD_EAST", "PAD_WEST", "PAD_NORTH", "PAD_LEFTBUMPER", "PAD_RIGHTBUMPER",
+         "PAD_BACK", "PAD_START", "PAD_GUIDE", "PAD_LEFTSTICK", "PAD_RIGHTSTICK", "PAD_UP", "PAD_DOWN",
+         "PAD_LEFT", "PAD_RIGHT", "PAD_LEFTTRIGGER", "PAD_RIGHTTRIGGER"].contains(key)
+    }
+
     static func normalizeCancel(keyCode: UInt16, charactersIgnoringModifiers: String?) -> String? {
         keyCode == 53 ? "ESC" : normalize(keyCode: keyCode, charactersIgnoringModifiers: charactersIgnoringModifiers)
     }
 
-    static func isValidCancel(_ key: String) -> Bool { key == "ESC" || isValid(key) }
+    static func isValidCancel(_ key: String) -> Bool { key == "ESC" || isValid(key) || isGamepad(key) }
 
     static func displayLabel(_ key: String) -> String {
         switch key {
@@ -68,9 +74,28 @@ enum JoystickPreset: Equatable {
     }
 }
 
-enum MappingPlacementMode: Equatable {
+enum MappingPlacementMode: Hashable {
+    case none
     case tap
     case joystick
+    case repeatTap
+    case swipe
+    case gesture
+    case fpsView
+    case skillAim
+    case script
+
+    var action: MappingAction {
+        switch self {
+        case .none, .tap, .joystick: return .tap
+        case .repeatTap: return .repeatHold
+        case .swipe: return .swipe
+        case .gesture: return .gesture
+        case .fpsView: return .fpsView
+        case .skillAim: return .skillAim
+        case .script: return .script
+        }
+    }
 }
 
 /// A final path position must be sent before its touch is released.
@@ -350,6 +375,15 @@ struct JoystickBinding: Codable, Equatable {
         let ry = aspect >= 1 ? radius : radius * aspect
         return (min(1, max(0, x + ux * rx)), min(1, max(0, y + uy * ry)))
     }
+
+    func analogTarget(x dx: Double, y dy: Double, aspectWidthOverHeight aspect: Double) -> (x: Double, y: Double) {
+        guard dx.isFinite, dy.isFinite, aspect.isFinite, aspect > 0 else { return (x, y) }
+        let magnitude = hypot(dx, dy)
+        let scale = magnitude > 1 ? 1 / magnitude : 1
+        let rx = aspect >= 1 ? radius / aspect : radius
+        let ry = aspect >= 1 ? radius : radius * aspect
+        return (min(1, max(0, x + dx * scale * rx)), min(1, max(0, y - dy * scale * ry)))
+    }
 }
 
 struct MappingPoint: Equatable {
@@ -397,17 +431,17 @@ struct MappingScheme: Codable, Equatable {
     var isEmpty: Bool { bindings.isEmpty && joysticks.isEmpty }
 
     func validate() -> Bool {
-        guard (1...5).contains(version), bindings.count <= 256, joysticks.count <= 16 else { return false }
+        guard (1...6).contains(version), bindings.count <= 256, joysticks.count <= 16 else { return false }
         var seen = Set<String>()
         var bindingCounts: [Int: Int] = [:]
         var joystickCounts: [Int: Int] = [:]
         for b in bindings {
-            guard MappingKey.isValid(b.key), b.x.isFinite, b.y.isFinite,
+            guard (MappingKey.isValid(b.key) || (version >= 6 && MappingKey.isGamepad(b.key))), b.x.isFinite, b.y.isFinite,
                   (0...1).contains(b.x), (0...1).contains(b.y), (0...3).contains(b.rotation),
                   (40...5000).contains(b.repeatIntervalMs), (version >= 2 || b.action == .tap),
                   (version >= 3 || (b.action != .fpsView && b.action != .skillAim)),
                   (b.action != .script || (version >= 4 && UUID(uuidString: b.scriptID) != nil)),
-                  (b.cancelKey == nil || (version >= 5 && b.action == .skillAim && MappingKey.isValidCancel(b.cancelKey ?? "") && b.cancelKey != b.key)),
+                  (b.cancelKey == nil || (version >= 5 && b.action == .skillAim && MappingKey.isValidCancel(b.cancelKey ?? "") && (!MappingKey.isGamepad(b.cancelKey ?? "") || version >= 6) && b.cancelKey != b.key)),
                   b.sensitivity.isFinite, (0.1...5).contains(b.sensitivity),
                   b.aimRadius.isFinite, (0.05...0.45).contains(b.aimRadius),
                   b.endX.isFinite, b.endY.isFinite, (0...1).contains(b.endX), (0...1).contains(b.endY), (40...10000).contains(b.durationMs),
@@ -459,7 +493,14 @@ final class KeyMappingStore: ObservableObject {
             onChange?()
         }
     }
-    @Published var placementMode: MappingPlacementMode = .tap { didSet { if placementMode == .joystick { pendingPoint = nil } } }
+    @Published var placementMode: MappingPlacementMode = .tap {
+        didSet {
+            if placementMode == .none { clearSelection() }
+            else if placementMode == .joystick { pendingPoint = nil }
+            if placementMode != oldValue { onChange?() }
+        }
+    }
+    var placementScriptID: String?
     @Published private(set) var pendingPoint: MappingPoint? { didSet { onChange?() } }
     @Published private(set) var selectedKey: String? { didSet { onChange?() } }
     @Published private(set) var selectedJoystickIndex: Int? { didSet { onChange?() } }
@@ -468,6 +509,11 @@ final class KeyMappingStore: ObservableObject {
     @Published private(set) var profiles: [String] = []
     @Published private(set) var activeProfileName: String?
     @Published private(set) var foregroundPackage: String?
+    @Published private(set) var foregroundIsLauncher: Bool? = nil
+    @Published var appNames: [String: String] = [:]
+    var currentProfilePackage: String? {
+        associations.profiles.keys.sorted().first { associations.profiles[$0] == (activeProfileName ?? "") }
+    }
     @Published private(set) var autoSwitchEnabled = false
     @Published private(set) var associatedProfile: String?
     @Published private(set) var associationError: String?
@@ -544,11 +590,12 @@ final class KeyMappingStore: ObservableObject {
     private func loadAssociations() {
         associations = AppAssociations(); associationError = nil
         guard let url = associationsURL, FileManager.default.fileExists(atPath: url.path) else {
-            autoSwitchEnabled = false; return
+            autoSwitchEnabled = UserDefaults.standard.bool(forKey: "miko.keymap.autoSwitch"); return
         }
         do {
             associations = try JSONDecoder().decode(AppAssociations.self, from: Data(contentsOf: url))
-            autoSwitchEnabled = associations.enabled
+            if UserDefaults.standard.object(forKey: "miko.keymap.autoSwitch") == nil { UserDefaults.standard.set(associations.enabled, forKey: "miko.keymap.autoSwitch") }
+            autoSwitchEnabled = UserDefaults.standard.bool(forKey: "miko.keymap.autoSwitch")
         } catch {
             autoSwitchEnabled = false
             associationError = "Could not read application associations: \(error.localizedDescription)"
@@ -571,12 +618,15 @@ final class KeyMappingStore: ObservableObject {
     func setAutoSwitch(_ enabled: Bool) -> Bool {
         var next = associations; next.enabled = enabled
         if enabled { manuallyOverriddenPackage = nil }
-        return saveAssociations(next)
+        guard saveAssociations(next) else { return false }
+        UserDefaults.standard.set(enabled, forKey: "miko.keymap.autoSwitch")
+        return true
     }
 
     func associateForegroundWithCurrentProfile() -> Bool {
-        guard let package = foregroundPackage else { return false }
+        guard let package = foregroundPackage, foregroundIsLauncher == false else { return false }
         var next = associations
+        next.profiles = next.profiles.filter { $0.value != (activeProfileName ?? "") }
         next.profiles[package] = activeProfileName ?? ""
         guard saveAssociations(next) else { return false }
         associatedProfile = activeProfileName ?? ""
@@ -585,19 +635,20 @@ final class KeyMappingStore: ObservableObject {
     }
 
     func removeForegroundAssociation() -> Bool {
-        guard let package = foregroundPackage else { return false }
+        guard let package = currentProfilePackage else { return false }
         var next = associations; next.profiles.removeValue(forKey: package)
         guard saveAssociations(next) else { return false }
         associatedProfile = nil
         return true
     }
 
-    func updateForeground(_ package: String, beforeSwitch: () -> Void) {
+    func updateForeground(_ package: String, isLauncher: Bool? = false, beforeSwitch: () -> Void) {
+        foregroundIsLauncher = isLauncher
         if foregroundPackage != package {
             foregroundPackage = package; manuallyOverriddenPackage = nil
         }
         associatedProfile = associations.profiles[package]
-        guard autoSwitchEnabled, associationError == nil, !editing,
+        guard UserDefaults.standard.bool(forKey: "miko.keymap.autoSwitch"), associationError == nil, !editing,
               manuallyOverriddenPackage != package, let profile = associations.profiles[package] else { return }
         let target: String? = profile.isEmpty ? nil : profile
         guard target != activeProfileName else { return }
@@ -696,12 +747,8 @@ final class KeyMappingStore: ObservableObject {
     }
     func applyTemplate(_ template: MappingTemplate, rotation: Int) {
         guard editing, (0...3).contains(rotation) else { return }
-        var copy = draft
-        copy.bindings.removeAll { $0.rotation == rotation }
-        copy.joysticks.removeAll { $0.rotation == rotation }
         let preset = template.scheme(for: rotation)
-        copy.bindings.append(contentsOf: preset.bindings)
-        copy.joysticks.append(contentsOf: preset.joysticks)
+        let copy = MappingScheme(bindings: preset.bindings, joysticks: preset.joysticks)
         guard copy.validate() else { return }
         placementMode = .tap
         pendingPoint = nil
@@ -895,7 +942,7 @@ final class KeyMappingStore: ObservableObject {
               draft.bindings[index].action == .skillAim else { return false }
         var copy = draft
         copy.bindings[index].cancelKey = cancelKey
-        if cancelKey != nil { copy.version = max(copy.version, 5) }
+        if let cancelKey { copy.version = max(copy.version, MappingKey.isGamepad(cancelKey) ? 6 : 5) }
         guard copy.validate() else { return false }
         draft = copy
         return true
@@ -961,15 +1008,25 @@ final class KeyMappingStore: ObservableObject {
     func assign(_ key: String) -> Bool {
         guard editing else { return false }
         var copy = draft
+        if MappingKey.isGamepad(key) { copy.version = max(copy.version, 6) }
         if let point = pendingPoint {
-            let binding = MappingBinding(key: key, x: point.x, y: point.y, rotation: point.rotation)
+            let action = placementMode.action
+            var binding = MappingBinding(key: key, x: point.x, y: point.y, rotation: point.rotation, action: action)
+            if action == .gesture {
+                binding.trace = [MappingTracePoint(x: point.x, y: point.y, tMs: 0),
+                                 MappingTracePoint(x: point.x, y: point.y, tMs: 300)]
+            }
+            if action == .script { binding.scriptID = placementScriptID ?? "" }
+            if action == .fpsView || action == .skillAim { copy.version = max(copy.version, 3) }
+            else if action == .script { copy.version = max(copy.version, 4) }
+            else if action != .tap { copy.version = max(copy.version, 2) }
             if let i = copy.bindings.firstIndex(where: { $0.key == key && $0.rotation == point.rotation }) {
                 copy.bindings[i] = binding
             } else {
                 copy.bindings.append(binding)
             }
             guard copy.validate() else { return false }
-            draft = copy; pendingPoint = nil; selectedKey = nil; return true
+            draft = copy; pendingPoint = nil; selectedKey = key; return true
         }
         if let existingKey = selectedKey,
            let existing = copy.bindings.first(where: { $0.key == existingKey && $0.rotation == currentRotation }) {

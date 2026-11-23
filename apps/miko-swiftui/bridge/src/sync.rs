@@ -292,6 +292,23 @@ impl BridgeSync {
         }
     }
 
+    pub fn emit_leader_gamepad(
+        &mut self,
+        session: uuid::Uuid,
+        sequence: u64,
+        report: Option<[u8; 13]>,
+        ended: bool,
+    ) {
+        if self.role != SyncRole::Leader {
+            return;
+        }
+        self.next_seq = self.next_seq.saturating_add(1);
+        eprintln!(
+            "{SYNC_PREFIX}{}",
+            json!({"seq":self.next_seq,"event":{"type":"gamepad","session":session,"sequence":sequence,"report":report,"ended":ended}})
+        );
+    }
+
     /// Emits a `MIKO_SYNC_STATUS:{"state":"release"}` line when leading so
     /// followers also release held inputs when leader playback stops/pauses.
     pub fn emit_leader_release(&self) {

@@ -172,6 +172,8 @@ final class CenterModel: ObservableObject {
     @Published var paletteQuery = "" { didSet { if paletteSelection != 0 { paletteSelection = 0 } } }
     @Published var paletteSelection = 0
     private var pendingSheetAfterDetails: CenterSheet?
+    private var directEditDetails: Details?
+    @Published private(set) var directEditLoadingID: String?
 
     private lazy var bridge = CenterBridgeProcess(executable: centerExecutable,
         onEvent: { [weak self] event, session in self?.applyEvent(event, session: session) },
@@ -337,6 +339,9 @@ final class CenterModel: ObservableObject {
     /// restart the bridge, and show "reconnecting" until a reply arrives.
     private func connectionLost() {
         guard !stopping, reconnectWorkItem == nil else { return }
+        for player in players.values where player.transport.gamepadMode == .touch {
+            player.transport.stopGamepadCapture()
+        }
         appsLoading = false
         stopHeartbeat()
         bridge.stopWriting()
@@ -465,10 +470,47 @@ final class CenterModel: ObservableObject {
     private func applyEvent(_ event: [String:Any], session: Int) {
         guard session == bridgeSession else { return }
         guard let kind = event["type"] as? String else { return }
+        if kind == "gamepad_events_lost" {
+            for player in players.values where player.transport.gamepadMode == .touch {
+                player.transport.stopGamepadCapture()
+            }
+            if let leader = syncHub.session?.leader {
+                syncHub.blockNativeSession()
+                syncHub.releaseFollowers(from: leader)
+                if players[leader]?.transport.gamepadMode == .native {
+                    call("input.gamepad.disconnect", ["device": leader]) { _ in }
+                }
+            }
+            return
+        }
         if kind == "device_event" {
             bridgeAnswered()
             var immediateRefresh = false
             if let event = event["event"] as? [String:Any], let topic = event["topic"] as? String {
+                if topic == "events.lagged" {
+                    for player in players.values where player.transport.gamepadMode == .touch {
+                        player.transport.stopGamepadCapture()
+                    }
+                    if let leader = syncHub.session?.leader {
+                        syncHub.blockNativeSession()
+                        syncHub.releaseFollowers(from: leader)
+                        if players[leader]?.transport.gamepadMode == .native {
+                            call("input.gamepad.disconnect", ["device": leader]) { _ in }
+                        }
+                    }
+                    return
+                }
+                if topic == "input.gamepad.native", let data = event["data"] as? [String: Any],
+                   let device = data["device"] as? String, syncHub.session?.leader == device {
+                    if let session = data["session"] as? String { syncHub.observeNativeSession(session) }
+                    players[device]?.transport.sendNativeGamepadLeader(data)
+                    return
+                }
+                if topic == "input.gamepad.event", let data = event["data"] as? [String: Any],
+                   let device = data["device"] as? String {
+                    players[device]?.transport.receiveGamepadEvent(data)
+                    return
+                }
                 if topic == "device.snapshot_warning", let data = event["data"] as? [String:Any] {
                     let reason = data["reason"] as? String ?? ""
                     if reason == "low_resources" {
@@ -650,9 +692,11 @@ final class CenterModel: ObservableObject {
             startJobsTimer()
             refreshJobs()
         case .device(let kind):
-            guard let parent = centerWindow else { panelCoordinator.request(nil); return }
+            guard let parent = centerWindow else { directEditDetails = nil; panelCoordinator.request(nil); return }
             sheet = kind
-            deviceSheetPanel = DeviceSheetPanelController(model: self, kind: kind, parent: parent)
+            let editDetails = kind == .edit ? directEditDetails : nil
+            directEditDetails = nil
+            deviceSheetPanel = DeviceSheetPanelController(model: self, kind: kind, parent: parent, editDetails: editDetails)
         }
     }
 
@@ -802,6 +846,31 @@ final class CenterModel: ObservableObject {
             select(device)
             pendingSheetAfterDetails = sheet
         } else { present(sheet) }
+    }
+
+    /// Load an edit target without changing the device library's selection.
+    func presentDeviceSettingsFromList(_ id: String) {
+        guard !onboardingInstallForegroundRequired else { showOnboardingInstallBlocker(); return }
+        guard directEditLoadingID == nil else { return }
+        if case .device = panelCoordinator.active { return }
+        if case .device = panelCoordinator.desired { return }
+        directEditLoadingID = id
+        call("device.details", ["device": id]) { [weak self] result in
+            guard let self, self.directEditLoadingID == id else { return }
+            self.directEditLoadingID = nil
+            guard self.showingAllDevices, !self.onboardingInstallForegroundRequired,
+                  self.devices.contains(where: { $0.id == id }) else { return }
+            if case .device = self.panelCoordinator.active { return }
+            if case .device = self.panelCoordinator.desired { return }
+            do {
+                let details = try self.decode(result.get(), as: Details.self)
+                guard details.device.id == id else { return }
+                self.directEditDetails = details
+                self.present(.edit)
+            } catch {
+                self.showError(error)
+            }
+        }
     }
 
     // MARK: - Quit guard
@@ -1407,6 +1476,7 @@ final class CenterModel: ObservableObject {
                     : (launch ?? self.playerLaunchState(for: details.device))
                 self.windowRegistry.setInitialLaunchState(launchState, for: id)
                 let player = GameWindowController()
+                var feedbackBinding: (leader: String, session: String)?
                 player.transport.setBackgroundFrameMode(.saved)
                 player.chrome.scriptAction = { [weak self] action, completion in
                     self?.performScriptAction(action, completion: completion)
@@ -1429,7 +1499,27 @@ final class CenterModel: ObservableObject {
                         }
                     }
                 }
+                player.transport.onSyncInputFailure = { [weak self] message in
+                    self?.syncHub.failFollower(id, message: message)
+                }
+                player.transport.onSyncGamepadFeedback = { [weak self] session, vibrating in
+                    guard let self else { return }
+                    if vibrating {
+                        guard let sync = self.syncHub.session,
+                              sync.followers.contains(where: { $0.device == id }) else { return }
+                        feedbackBinding = (sync.leader, session)
+                    }
+                    guard let binding = feedbackBinding, binding.session == session else { return }
+                    self.call("input.gamepad.feedback", ["device": binding.leader, "session": session,
+                              "source": id, "vibrating": vibrating]) { _ in }
+                    if !vibrating { feedbackBinding = nil }
+                }
                 player.transport.onSyncBridgeLost = { [weak self] in
+                    if let binding = feedbackBinding {
+                        self?.call("input.gamepad.feedback", ["device": binding.leader, "session": binding.session,
+                                   "source": id, "vibrating": false]) { _ in }
+                        feedbackBinding = nil
+                    }
                     self?.syncHub.markBridgeLost(for: id)
                 }
                 player.transport.onSyncLeaderRelease = { [weak self] in
@@ -1444,12 +1534,71 @@ final class CenterModel: ObservableObject {
                     guard let self, let transport else { return }
                     self.toggleGamepad(for: id, transport: transport)
                 }
+                player.transport.onStopGamepad = { [weak self, weak transport = player.transport] in
+                    guard let self, let transport, let session = transport.gamepadExpectedSession else { return }
+                    self.call("input.gamepad.disconnect", ["device": id, "session": session]) { _ in }
+                }
+                player.transport.onSelectGamepad = { [weak self, weak transport = player.transport] controller in
+                    guard let self, let transport else { return }
+                    self.toggleGamepad(for: id, transport: transport, controller: controller)
+                }
+                player.transport.onRefreshGamepads = { [weak self, weak transport = player.transport] in
+                    guard let self, let transport, !transport.gamepadRefreshPending else { return }
+                    transport.gamepadRefreshPending = true
+                    self.call("input.gamepad.list") { [weak self, weak transport] result in
+                        guard let self, let transport else { return }
+                        transport.gamepadRefreshPending = false
+                        switch result {
+                        case .success(let value):
+                            if let controllers = GamepadController.parseList(value) {
+                                transport.gamepads = controllers
+                                transport.gamepadListError = nil
+                            } else {
+                                transport.gamepadListError = self.text("无法读取手柄列表", "Could not read game controller list")
+                            }
+                        case .failure(let error):
+                            transport.gamepadListError = OperationMessages.error(error.localizedDescription, language: self.language)
+                        }
+                    }
+                }
+                player.transport.onRefreshGamepadStatus = { [weak self, weak transport = player.transport] in
+                    guard let self, let transport, transport.linkState.isRunning, !transport.gamepadStatusPending,
+                          transport.gamepadState == .connected || transport.gamepadRecovering || transport.gamepadPanelOpen,
+                          transport.gamepadState != .connecting else { return }
+                    let previous = transport.gamepadState
+                    let wasRecovering = transport.gamepadRecovering
+                    transport.gamepadStatusPending = true
+                    self.call("input.gamepad.get", ["device": id]) { [weak transport] result in
+                        guard let transport else { return }
+                        transport.gamepadStatusPending = false
+                        guard transport.gamepadState == previous, transport.gamepadRecovering == wasRecovering,
+                              case .success(let value) = result, let dict = value as? [String: Any],
+                              let connected = dict["connected"] as? Bool else { return }
+                        transport.gamepadRecovering = dict["recovering"] as? Bool ?? false
+                        if dict["mode"] as? String == "touch" {
+                            transport.gamepadMode = .touch
+                            transport.gamepadExpectedSession = dict["session"] as? String
+                        } else {
+                            if transport.gamepadMode == .touch && transport.gamepadExpectedSession != nil { transport.finishGamepadCapture() }
+                            if connected { transport.gamepadMode = .native }
+                        }
+                        if connected { transport.gamepadState = .connected }
+                        else if transport.gamepadState != .failed { transport.gamepadState = .disconnected }
+                    }
+                }
+                player.transport.startGamepadStatusPolling()
                 if details.device.running {
                     self.call("input.gamepad.get", ["device": id]) { result in
-                        if case .success(let value) = result,
+                        if player.transport.gamepadState == .disconnected,
+                           case .success(let value) = result,
                            let dict = value as? [String: Any],
                            let connected = dict["connected"] as? Bool {
                             player.transport.gamepadState = connected ? .connected : .disconnected
+                            player.transport.gamepadRecovering = dict["recovering"] as? Bool ?? false
+                            if dict["mode"] as? String == "touch" {
+                                player.transport.gamepadMode = .touch
+                                player.transport.gamepadExpectedSession = dict["session"] as? String
+                            } else if connected { player.transport.gamepadMode = .native }
                         }
                     }
                 }
@@ -1461,6 +1610,10 @@ final class CenterModel: ObservableObject {
                 }
                 player.onStopRequested = { [weak self] in self?.stopAfterWindowClose(id) }
                 player.onClose = { [weak self, weak player] in
+                    if player?.transport.gamepadMode == .touch {
+                        player?.transport.stopGamepadCapture()
+                    }
+                    player?.transport.stopGamepadStatusPolling()
                     if let frame = player?.transport.lastFrame { self?.rememberThumbnail(frame, device: id) }
                     self?.syncHub.unregisterBridge(for: id)
                     self?.windowRegistry.clearBackground(id)
@@ -1471,6 +1624,14 @@ final class CenterModel: ObservableObject {
                 player.open(device:id,width:width,height:height,executable:self.bridgeExecutable,displayName:details.device.name,quality:quality,dataDirectory:dataDirectory,
                             launch: launchState, hidden: effectiveHidden,
                             onStartDevice: { [weak self] in self?.start(id) })
+                player.transport.onForegroundChanged = { [weak self, weak player] in
+                    guard let self else { return }
+                    self.call("app.list", ["device": id]) { [weak self, weak player] result in
+                        guard let self, let player, case .success(let value) = result,
+                              let list = try? self.decode(value, as: AppList.self) else { return }
+                        player.transport.mapping.appNames = Dictionary(uniqueKeysWithValues: list.apps.filter { $0.name != $0.package }.map { ($0.package, $0.name) })
+                    }
+                }
                 self.syncHub.registerBridge(player.transport, for: id, background: effectiveHidden)
                 self.onPlayersChanged?()
             } catch {
@@ -1480,32 +1641,82 @@ final class CenterModel: ObservableObject {
         }
     }
 
-    private func toggleGamepad(for id: String, transport: PlayerTransport) {
+    private func toggleGamepad(for id: String, transport: PlayerTransport, controller: Int? = nil) {
+        if transport.gamepadRecovering && controller == nil {
+            if transport.gamepadMode == .touch { transport.stopGamepadCapture(); return }
+            call("input.gamepad.disconnect", ["device": id]) { [weak self] result in
+                if case .failure(let error) = result { self?.showError(error.localizedDescription) }
+            }
+            return
+        }
         switch transport.gamepadState {
-        case .disconnected:
+        case .disconnected, .failed:
+            guard let controller else { return }
             transport.gamepadState = .connecting
-            call("input.gamepad.connect", ["device": id], onProgress: { [weak self, weak transport] _, progressMessage, _ in
+            let calibration = transport.gamepads.first(where: { $0.id == controller }).map {
+                GamepadTuningStore.load(controller: $0, package: transport.mapping.foregroundPackage).parameters
+            } ?? GamepadTuning().parameters
+            var hasConnected = false
+            let method = transport.gamepadMode == .touch ? "input.gamepad.capture" : "input.gamepad.connect"
+            let captureSession = transport.gamepadMode == .touch ? transport.beginGamepadCapture() : nil
+            var parameters: [String: Any] = ["device": id, "controller": controller, "calibration": calibration]
+            if let captureSession { parameters["session"] = captureSession }
+            call(method, parameters, onProgress: { [weak self, weak transport] progressMessage, _, _ in
                 guard let self, let transport else { return }
-                if let progressMessage, !progressMessage.isEmpty, transport.gamepadState != .connected {
-                    transport.gamepadState = .connected
-                    transport.onStatus?(self.text("已连接游戏手柄", "Game controller connected"))
+                if let captureSession, transport.gamepadExpectedSession != captureSession { return }
+                if progressMessage == "miko.gamepad.disconnected" {
+                    transport.gamepadRecovering = true
+                    transport.onStatus?(self.text("手柄已断开：物理手柄连接中断", "Controller disconnected: physical controller unavailable"))
+                }
+                let next = transport.gamepadState.receivingProgress(progressMessage, recovering: transport.gamepadRecovering)
+                if next != transport.gamepadState {
+                    transport.gamepadState = next
+                    if progressMessage == "miko.gamepad.ready" {
+                        transport.gamepadRecovering = false
+                        if !hasConnected { transport.onStatus?(self.text("已连接游戏手柄", "Game controller connected")) }
+                        hasConnected = true
+                    }
                 }
             }) { [weak self, weak transport] result in
                 guard let self, let transport else { return }
-                transport.gamepadState = .disconnected
-                if case .failure(let error) = result {
+                if let captureSession, transport.gamepadExpectedSession != captureSession { return }
+                let wasConnected = hasConnected || transport.gamepadState == .connected
+                if captureSession != nil { transport.finishGamepadCapture() }
+                transport.gamepadRecovering = false
+                switch result {
+                case .failure(let error):
+                    transport.gamepadState = wasConnected ? .disconnected : .failed
+                    if wasConnected && error.localizedDescription == "cancelled" {
+                        transport.onStatus?(self.text("手柄已断开：手柄转发已取消", "Controller disconnected: forwarding was cancelled"))
+                        break
+                    }
                     let message = OperationMessages.error(error.localizedDescription, language: self.language)
                     transport.onStatus?(message)
                     self.showError(message)
+                case .success(let value):
+                    transport.gamepadState = .disconnected
+                    let reason = (value as? [String: Any])?["ended"] as? String
+                    let message: String
+                    switch reason {
+                    case "unplugged": message = self.text("手柄已断开：物理手柄连接中断", "Controller disconnected: physical controller unavailable")
+                    case "identity_ambiguous": message = self.text("手柄已断开：无法区分同型号手柄", "Controller disconnected: identical controllers cannot be distinguished")
+                    case "input_failed": message = self.text("手柄已断开：手柄输入中断", "Controller disconnected: controller input failed")
+                    case "device_stopped": message = self.text("手柄已断开：模拟器输入不可用", "Controller disconnected: emulator input unavailable")
+                    default:
+                        message = captureSession != nil && transport.gamepadManualTakeover
+                            ? self.text("手柄已断开：手动输入已接管", "Controller disconnected: manual input took over")
+                            : self.text("已断开游戏手柄", "Game controller disconnected")
+                    }
+                    transport.onStatus?(message)
                 }
             }
         case .connected:
-            transport.gamepadState = .disconnected
+            if transport.gamepadMode == .touch { transport.stopGamepadCapture(); break }
             call("input.gamepad.disconnect", ["device": id]) { [weak self, weak transport] result in
                 guard let self, let transport else { return }
                 switch result {
                 case .success:
-                    transport.onStatus?(self.text("已断开游戏手柄", "Game controller disconnected"))
+                    break // The forwarding job reports disconnection after release.
                 case .failure(let error):
                     transport.gamepadState = .connected
                     let message = OperationMessages.error(error.localizedDescription, language: self.language)
@@ -1537,6 +1748,7 @@ final class CenterModel: ObservableObject {
             alert.messageText = text("选择目标设备", "Choose a device")
             alert.informativeText = text("选择要录制或回放操作的设备。", "Choose the device for recording or playback.")
             let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 260, height: 26))
+            picker.isBordered = false
             picker.addItems(withTitles: running.map(\.name))
             alert.accessoryView = picker
             alert.addButton(withTitle: text("继续", "Continue"))

@@ -119,6 +119,8 @@ struct AllDevicesView: View {
     @State private var startInterval = 2
     @State private var selectedGroup: String?
     @State private var showFlowEditor = false
+    @State private var showBudgetInfo = false
+    @State private var showDeviceUsage = false
     init(model: CenterModel) {
         self.model = model
         self.groups = model.deviceGroups
@@ -132,36 +134,24 @@ struct AllDevicesView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(t("全部设备", "All devices")).font(.title2.weight(.semibold))
-                    Text(String(format: t("%d 台设备", "%d devices"), visibleDevices.count))
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button(t("界面流程", "UI workflows")) { showFlowEditor = true }
+            HStack(spacing: 12) {
+                Text(t("全部设备", "All devices") + " (\(visibleDevices.count))")
+                    .font(.title3.weight(.semibold)).lineLimit(1)
+                Spacer(minLength: 8)
+                Button(t("排列窗口", "Arrange windows")) { model.arrangePlayerWindows() }
                     .buttonStyle(WbPillButtonStyle())
-                if #available(macOS 26.0, *) {
-                    viewPicker
-                        .controlSize(.large)
-                        .clipShape(Capsule())
-                        .glassEffect(.regular, in: Capsule())
-                    newDeviceButton
-                        .buttonStyle(.glass)
-                        .buttonBorderShape(.capsule)
-                        .controlSize(.large)
-                } else {
-                    viewPicker
-                    newDeviceButton
-                }
+                    .disabled(!model.hasPlayers)
+                viewPicker
+                newDeviceButton
+                    .buttonStyle(.borderedProminent)
             }
             budgetSummary
             groupControls
-            batchControls
             if visibleDevices.isEmpty {
                 VStack(spacing: 8) {
                     Text(t("没有匹配的设备", "No matching devices")).foregroundStyle(.secondary)
                     Button(t("显示全部设备", "Show all devices")) { model.deviceQuery = ""; selectedGroup = nil }
+                        .buttonStyle(WbPillButtonStyle())
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
@@ -177,7 +167,7 @@ struct AllDevicesView: View {
                 }
             }
         }
-        .padding(24)
+        .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .accessibilityIdentifier("all-devices-view")
         .sheet(isPresented: $showFlowEditor) {
@@ -211,110 +201,149 @@ struct AllDevicesView: View {
     }
 
     private var budgetSummary: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
                 Label(t("设备内存预算", "Device memory budget"), systemImage: "memorychip")
-                    .font(.subheadline.weight(.semibold))
-                Spacer()
+                    .font(.subheadline.weight(.semibold)).fixedSize()
                 if let budget {
+                    ProgressView(value: budget.fraction)
+                        .tint(budget.used_mb > budget.budget_mb ? .orange : .accentColor)
+                        .frame(minWidth: 50, maxWidth: .infinity)
                     Text("\(DeviceBudget.gigabytes(budget.used_mb)) / \(DeviceBudget.gigabytes(budget.budget_mb))")
-                        .font(.subheadline.monospacedDigit())
+                        .font(.caption.monospacedDigit()).fixedSize()
                 } else if budgetLoading {
-                    ProgressView().controlSize(.small)
-                } else if budgetError {
+                    Spacer(); ProgressView().controlSize(.small)
+                } else {
+                    Spacer()
                     Button(t("重试", "Retry")) { refreshBudget() }
-                        .buttonStyle(WbPillButtonStyle())
+                        .buttonStyle(WbPillButtonStyle()).disabled(!budgetError)
                 }
+                Button { showBudgetInfo.toggle() } label: { Image(systemName: "info.circle") }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(t("预算说明", "Budget information"))
+                    .popover(isPresented: $showBudgetInfo, arrowEdge: .bottom) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(t("设备内存预算", "Device memory budget")).font(.headline)
+                            if let budget {
+                                Text(t("预算为 Mac 内存的 \(budget.budget_percent)%；预算占用取预估值与最近测量值的较大者。CPU 和内存约每 30 秒采样，CPU 100% 相当于一个逻辑核心。", "Budget is \(budget.budget_percent)% of Mac memory; usage is the greater of estimated and last measured values. CPU and memory are sampled about every 30 seconds; 100% CPU is one logical core."))
+                            }
+                            Text(t("节省资源时，后台可见窗口最高显示 5 帧/秒，隐藏窗口暂停显示；仅减少播放器画面开销。", "In resource-saving mode, visible background windows display up to 5 fps and hidden windows pause display; only player display overhead is reduced."))
+                            Text(t("多开建议：新建设备可选择 agent-lean（720 × 1280、2 核、2 GB 内存、关闭音频和摄像头）；不会自动修改已有配置。", "For multiple devices, consider the agent-lean profile (720 × 1280, 2 cores, 2 GB RAM, audio and cameras off). Existing settings are not changed."))
+                        }.font(.caption).frame(width: 320, alignment: .leading).padding(16)
+                    }
             }
-            if let budget {
-                ProgressView(value: budget.fraction).tint(budget.used_mb > budget.budget_mb ? .orange : .accentColor)
-                Text(t("预算为 Mac 内存的 \(budget.budget_percent)%；预算占用取预估值与最近测量值的较大者。CPU 和内存约每 30 秒采样，CPU 100% 相当于一个逻辑核心。", "Budget is \(budget.budget_percent)% of Mac memory; budget usage is the greater of estimated and last measured values. CPU and memory are sampled about every 30 seconds; 100% CPU is one logical core."))
-                    .font(.caption).foregroundStyle(.secondary)
-                if !model.devices.isEmpty {
-                    DisclosureGroup(t("查看各设备占用", "Device usage")) {
-                        ScrollView {
-                            VStack(spacing: 6) {
-                                ForEach(model.devices) { device in
-                                    HStack {
-                                        Text(device.name).lineLimit(1)
-                                        Text(device.statusText(language: model.language)).foregroundStyle(.secondary)
-                                        Spacer()
-                                        if let usage = budget.devices.first(where: { $0.id == device.id }) {
-                                            Text(usage.cpu_percent.map { "CPU \($0)%" } ?? t("CPU 等待采样", "CPU awaiting sample"))
-                                                .monospacedDigit()
-                                            Text(usage.measured_mb.map { t("实测 ", "Measured ") + DeviceBudget.gigabytes($0) } ?? t("等待采样", "Awaiting sample"))
-                                                .monospacedDigit()
-                                            Text(t("预算 ", "Budget ") + DeviceBudget.gigabytes(usage.countedMB))
-                                                .foregroundStyle(.secondary).monospacedDigit()
-                                        }
-                                        if device.running {
-                                            Button(t("休眠", "Hibernate")) { model.hibernate(device.id) }
-                                                .buttonStyle(WbPillButtonStyle())
-                                                .disabled(model.busy.contains(device.id) || model.busyHolder(for: device.id) != nil)
-                                            Button(t("停止", "Stop")) { model.stop(device.id) }
-                                                .buttonStyle(WbPillButtonStyle())
-                                                .disabled(model.busy.contains(device.id) || model.busyHolder(for: device.id) != nil)
-                                        }
-                                    }.font(.caption)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) { backgroundPicker; Spacer(minLength: 4); usageButton }
+                VStack(alignment: .leading, spacing: 8) { backgroundPicker; usageButton }
+            }
+            if showDeviceUsage, let budget {
+                ScrollView {
+                    VStack(spacing: 6) {
+                        ForEach(model.devices) { device in
+                            HStack {
+                                Text(device.name).lineLimit(1)
+                                Text(device.statusText(language: model.language)).foregroundStyle(.secondary)
+                                Spacer()
+                                if let usage = budget.devices.first(where: { $0.id == device.id }) {
+                                    Text(usage.cpu_percent.map { "CPU \($0)%" } ?? t("CPU 等待采样", "CPU awaiting sample"))
+                                    Text(usage.measured_mb.map { t("实测 ", "Measured ") + DeviceBudget.gigabytes($0) } ?? t("等待采样", "Awaiting sample"))
+                                    Text(t("预算 ", "Budget ") + DeviceBudget.gigabytes(usage.countedMB)).foregroundStyle(.secondary)
                                 }
-                            }.padding(.top, 6)
-                        }.frame(maxHeight: 130)
-                    }.font(.caption)
-                }
-            } else if budgetError {
-                Text(t("无法读取设备内存预算。", "Could not load the device memory budget."))
-                    .font(.caption).foregroundStyle(.secondary)
+                                if device.running {
+                                    Button(t("休眠", "Hibernate")) { model.hibernate(device.id) }
+                                        .disabled(model.busy.contains(device.id) || model.busyHolder(for: device.id) != nil)
+                                    Button(t("停止", "Stop")) { model.stop(device.id) }
+                                        .disabled(model.busy.contains(device.id) || model.busyHolder(for: device.id) != nil)
+                                }
+                            }.font(.caption)
+                        }
+                    }
+                }.frame(maxHeight: 130)
             }
-            HStack {
-                Text(t("后台画面", "Background display"))
-                Picker(t("后台画面", "Background display"), selection: $backgroundFrameMode) {
-                    Text(t("保持实时画面", "Keep live")) .tag(BackgroundFrameMode.realTime.rawValue)
-                    Text(t("后台节省资源", "Save resources")) .tag(BackgroundFrameMode.saveResources.rawValue)
-                }
-                .labelsHidden().pickerStyle(.segmented).fixedSize()
-                Spacer()
-            }.font(.caption)
-            Text(t("节省资源时，后台可见窗口最高显示 5 帧/秒，隐藏窗口暂停显示；仅减少播放器画面开销。", "In resource-saving mode, visible background windows display up to 5 fps and hidden windows pause display; only player display overhead is reduced."))
-                .font(.caption).foregroundStyle(.secondary)
-            Text(t("多开建议：新建设备可选择 agent-lean（720 × 1280、2 核、2 GB 内存、关闭音频和摄像头）；不会自动修改已有配置。", "For multiple devices, consider the agent-lean profile (720 × 1280, 2 cores, 2 GB RAM, audio and cameras off) when creating devices. Existing settings are not changed."))
-                .font(.caption).foregroundStyle(.secondary)
         }
         .padding(12)
-        .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(WbColor.borderSubtle))
+        .modifier(WbCardMaterial(radius: 10))
         .accessibilityIdentifier("device-memory-budget")
     }
 
-    private var viewPicker: some View {
-        Picker(t("显示方式", "View"), selection: $model.gridView) {
-            Image(systemName: "list.bullet").accessibilityLabel(t("列表", "List")).tag(false)
-            Image(systemName: "square.grid.2x2").accessibilityLabel(t("网格", "Grid")).tag(true)
+    private var backgroundPicker: some View {
+        HStack(spacing: 8) {
+            Text(t("后台画面", "Background display")).fixedSize(horizontal: true, vertical: false)
+            WbSegmentedControl(
+                label: t("后台画面", "Background display"),
+                selectedLabel: t("已选择", "Selected"),
+                selection: $backgroundFrameMode,
+                options: [
+                    .init(value: BackgroundFrameMode.realTime.rawValue, title: t("保持实时画面", "Keep live")),
+                    .init(value: BackgroundFrameMode.saveResources.rawValue, title: t("后台节省资源", "Save resources"))
+                ],
+                segmentHeight: 22, fontSize: 11, inset: 2
+            ).frame(width: 200)
+        }.font(.caption).fixedSize(horizontal: true, vertical: false)
+    }
+
+    private var usageButton: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.18)) { showDeviceUsage.toggle() }
+        } label: {
+            Label(t("查看各设备占用", "Device usage"), systemImage: showDeviceUsage ? "chevron.down" : "chevron.right")
+                .labelStyle(.titleAndIcon)
         }
-        .pickerStyle(.segmented).labelsHidden()
-        .accessibilityLabel(t("设备显示方式", "Device view"))
+        .buttonStyle(.link).font(.system(size: 13))
+        .disabled(budget == nil || model.devices.isEmpty)
+    }
+
+    private var viewPicker: some View {
+        WbSegmentedControl(
+            label: t("设备显示方式", "Device view"),
+            selectedLabel: t("已选择", "Selected"),
+            selection: $model.gridView,
+            options: [
+                .init(value: false, title: t("列表", "List"), symbol: "list.bullet"),
+                .init(value: true, title: t("网格", "Grid"), symbol: "square.grid.2x2")
+            ],
+            iconOnly: true
+        ).frame(width: 76)
     }
 
     private var newDeviceButton: some View {
         Button(t("新建设备", "New device"), systemImage: "plus") { model.present(.newDevice) }
     }
 
-    private var batchControls: some View {
-        BatchControls(model: model, batch: model.batchOperations, selected: $selectedDevices, startInterval: $startInterval, visibleDevices: visibleDevices)
+    private var groupControls: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                groupPicker
+                Spacer(minLength: 8)
+                batchControls
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                groupPicker
+                batchControls
+            }
+        }
     }
 
-    private var groupControls: some View {
-        HStack {
+    private var batchControls: some View {
+        BatchControls(model: model, batch: model.batchOperations, selected: $selectedDevices,
+                      startInterval: $startInterval, visibleDevices: visibleDevices,
+                      showFlowEditor: { showFlowEditor = true })
+    }
+
+    private var groupPicker: some View {
+        HStack(spacing: 6) {
+            Text(t("分组：", "Group:"))
             Picker(t("设备分组", "Device group"), selection: $selectedGroup) {
                 Text(t("全部设备", "All devices")).tag(String?.none)
                 ForEach(groups.groups) { group in Text(group.name).tag(Optional(group.id)) }
-            }.frame(maxWidth: 260)
-            Button(t("新建分组…", "New group…")) {
+            }.labelsHidden().wbDropdownStyle().frame(maxWidth: 160)
+            Button(t("新建分组", "New group"), systemImage: "plus") {
                 if let name = groupName(title: t("新建设备分组", "New device group"), current: "") {
                     do { try groups.create(name: name, devices: selectedDevices) } catch { model.showError(groupError(error.localizedDescription)) }
                 }
-            }
+            }.buttonStyle(.borderless)
             if let id = selectedGroup, let group = groups.groups.first(where: { $0.id == id }) {
-                Menu(t("编辑分组", "Edit group")) {
+                Menu {
                     Button(t("添加所选设备", "Add selected devices")) { changeGroup(id, add: true) }.disabled(selectedDevices.isEmpty)
                     Button(t("移除所选设备", "Remove selected devices")) { changeGroup(id, add: false) }.disabled(selectedDevices.isEmpty)
                     Button(t("重命名…", "Rename…")) {
@@ -325,13 +354,14 @@ struct AllDevicesView: View {
                     Button(t("删除分组", "Delete group"), role: .destructive) {
                         do { try groups.delete(id: id); selectedGroup = nil } catch { model.showError(groupError(error.localizedDescription)) }
                     }
-                }
+                } label: { Image(systemName: "ellipsis.circle") }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                .help(t("编辑分组", "Edit group"))
             }
-            Button(t("排列窗口", "Arrange windows")) { model.arrangePlayerWindows() }
-                .disabled(!model.hasPlayers)
             if let error = groups.error { Text(groupError(error)).font(.caption).foregroundStyle(.red) }
-            Spacer()
         }
+        .font(.system(size: 12))
+        .frame(minHeight: 36)
     }
 
     private func changeGroup(_ id: String, add: Bool) {
@@ -374,14 +404,14 @@ struct AllDevicesView: View {
                 selectionControl(device)
                 deviceLink(device, thumbnailWidth: 32, thumbnailHeight: 56)
                 Spacer(minLength: 8)
+                deviceSettings(device)
                 deviceAction(device)
                 DeviceMoreButton(model: model, device: device).frame(width: 30, height: 28)
             }
             BatchResultLine(batch: model.batchOperations, id: device.id, language: model.language)
         }
         .padding(.horizontal, 14).padding(.vertical, 14)
-        .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(WbColor.borderSubtle))
+        .modifier(WbCardMaterial(radius: 10))
         .onAppear { model.loadCardHardware(device.id) }
     }
 
@@ -392,6 +422,7 @@ struct AllDevicesView: View {
                 deviceLink(device, thumbnailWidth: 42, thumbnailHeight: 72)
             }
             HStack {
+                deviceSettings(device)
                 deviceAction(device)
                 Spacer()
                 DeviceMoreButton(model: model, device: device).frame(width: 30, height: 28)
@@ -399,8 +430,7 @@ struct AllDevicesView: View {
             BatchResultLine(batch: model.batchOperations, id: device.id, language: model.language)
         }
         .padding(14).frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(WbColor.borderSubtle))
+        .modifier(WbCardMaterial(radius: 10))
         .onAppear { model.loadCardHardware(device.id) }
     }
 
@@ -410,8 +440,13 @@ struct AllDevicesView: View {
                 DevicePreview(model: model, device: device, width: thumbnailWidth, height: thumbnailHeight)
                 VStack(alignment: .leading, spacing: 6) {
                     Text(device.name).font(.system(size: 14, weight: .semibold)).lineLimit(1)
-                    Text(device.statusText(language: model.language) + " · " + device.androidVersionShort)
-                        .font(.system(size: 13)).foregroundStyle(.secondary).lineLimit(1)
+                    HStack(spacing: 5) {
+                        Circle().fill(device.running ? Color.green : (device.stopped ? Color.secondary : Color.orange))
+                            .frame(width: 6, height: 6).accessibilityHidden(true)
+                        Text(device.statusText(language: model.language) + " · " + device.androidVersionShort)
+                            .lineLimit(1)
+                    }
+                    .font(.system(size: 13)).foregroundStyle(.secondary)
                     if let hardware = model.cardHardware[device.id] {
                         Text(hardware.summary(language: model.language)).font(.caption).lineSpacing(2).foregroundStyle(.secondary).lineLimit(2)
                     }
@@ -426,6 +461,16 @@ struct AllDevicesView: View {
         .accessibilityLabel(t("查看设备：\(device.name)", "View device: \(device.name)"))
     }
 
+    private func deviceSettings(_ device: Device) -> some View {
+        Button { model.presentDeviceSettingsFromList(device.id) } label: {
+            Image(systemName: "gearshape")
+        }
+        .buttonStyle(.borderless)
+        .help(t("设备配置", "Device settings"))
+        .accessibilityLabel(t("设备配置：", "Device settings: ") + device.name)
+        .disabled(model.busy.contains(device.id) || model.directEditLoadingID != nil)
+    }
+
     @ViewBuilder private func deviceAction(_ device: Device) -> some View {
         switch DeviceOverviewPrimaryAction(state: device.status.state) {
         case .start:
@@ -433,10 +478,10 @@ struct AllDevicesView: View {
                 .buttonStyle(.borderedProminent).disabled(model.busy.contains(device.id))
         case .stop:
             Button(t("停止", "Stop"), systemImage: "stop") { model.stop(device.id) }
-                .disabled(model.busy.contains(device.id))
+                .buttonStyle(WbPillButtonStyle()).disabled(model.busy.contains(device.id))
         case .cancelStart:
             Button(t("取消启动", "Cancel start")) { model.stop(device.id) }
-                .disabled(model.busy.contains(device.id))
+                .buttonStyle(WbPillButtonStyle()).disabled(model.busy.contains(device.id))
         case .progress:
             ProgressView().controlSize(.small)
         }
@@ -449,38 +494,59 @@ private struct BatchControls: View {
     @Binding var selected: Set<String>
     @Binding var startInterval: Int
     let visibleDevices: [Device]
+    let showFlowEditor: () -> Void
     private func t(_ zh: String, _ en: String) -> String { model.text(zh, en) }
+    private var visibleIDs: Set<String> { Set(visibleDevices.map(\.id)) }
     private var selectedCount: Int { model.devices.filter { selected.contains($0.id) }.count }
+    private var allVisibleSelected: Bool { !visibleIDs.isEmpty && visibleIDs.isSubset(of: selected) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Button(t("全选当前列表", "Select visible")) { selected.formUnion(visibleDevices.map(\.id)) }
-                Button(t("清除选择", "Clear selection")) { selected.removeAll() }.disabled(selected.isEmpty)
-                Text(String(format: t("已选 %d 台", "%d selected"), selectedCount)).font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                if batch.running {
-                    Button(batch.cancelling ? t("正在取消…", "Cancelling…") : t("取消批量任务", "Cancel batch")) { batch.cancel() }
-                        .disabled(batch.cancelling)
+        HStack(spacing: 8) {
+            Toggle(t("全选", "Select all"), isOn: Binding(
+                get: { allVisibleSelected },
+                set: { if $0 { selected.formUnion(visibleIDs) } else { selected.subtract(visibleIDs) } }
+            )).toggleStyle(.checkbox).disabled(visibleIDs.isEmpty)
+            if selectedCount > 0 {
+                Text("\(selectedCount)").font(.caption).foregroundStyle(.secondary)
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 6) {
+                        Button(t("批量启动", "Start")) { model.beginBatch(.start(interval: TimeInterval(startInterval)), ids: selected) }
+                        Button(t("批量停止", "Stop")) { model.beginBatch(.stop, ids: selected) }
+                        Button(t("安装 APK", "Install APK")) { chooseAPK() }
+                    }.disabled(batch.running).buttonStyle(.borderless)
+                    Menu(t("批量操作", "Batch actions")) {
+                        Button(t("批量启动", "Start selected")) { model.beginBatch(.start(interval: TimeInterval(startInterval)), ids: selected) }
+                        Button(t("批量停止", "Stop selected")) { model.beginBatch(.stop, ids: selected) }
+                        Button(t("安装 APK…", "Install APK…")) { chooseAPK() }
+                    }.disabled(batch.running)
                 }
             }
-            HStack {
-                Button(t("批量启动", "Start selected")) { model.beginBatch(.start(interval: TimeInterval(startInterval)), ids: selected) }
-                    .disabled(selectedCount == 0 || batch.running)
-                Stepper(value: $startInterval, in: 0...30) {
-                    Text(t("启动间隔 \(startInterval) 秒", "Start interval: \(startInterval) s")).font(.caption)
-                }.fixedSize()
-                Button(t("批量停止", "Stop selected")) { model.beginBatch(.stop, ids: selected) }
-                    .disabled(selectedCount == 0 || batch.running)
-                Button(t("批量安装 APK…", "Install APK on selected…")) { chooseAPK() }
-                    .disabled(selectedCount == 0 || batch.running)
-                Button(t("批量克隆", "Clone selected")) { model.beginBatch(.clone, ids: selected) }
-                    .disabled(selectedCount == 0 || batch.running)
-                Spacer()
+            if batch.running {
+                Button(batch.cancelling ? t("正在取消…", "Cancelling…") : t("取消任务", "Cancel task")) { batch.cancel() }
+                    .buttonStyle(WbPillButtonStyle()).disabled(batch.cancelling)
             }
+            Menu {
+                if selectedCount > 0 {
+                    Button(t("批量克隆", "Clone selected")) { model.beginBatch(.clone, ids: selected) }.disabled(batch.running)
+                    Menu(t("启动间隔", "Start interval")) {
+                        ForEach(0...30, id: \.self) { seconds in
+                            Button { startInterval = seconds } label: {
+                                if startInterval == seconds { Label("\(seconds) s", systemImage: "checkmark") }
+                                else { Text("\(seconds) s") }
+                            }
+                        }
+                    }.disabled(batch.running)
+                    Button(t("清除全部选择", "Clear all selections")) { selected.removeAll() }
+                    Divider()
+                }
+                Button(t("界面流程…", "UI workflows…"), action: showFlowEditor)
+            } label: { Image(systemName: "ellipsis.circle") }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            .help(t("更多操作", "More actions"))
         }
-        .padding(12)
-        .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .font(.system(size: 12))
+        .frame(minHeight: 36)
+        .animation(.easeInOut(duration: 0.18), value: selectedCount > 0)
     }
 
     private func chooseAPK() {

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc as async_mpsc;
 
 mod frame_transport;
+mod native_gamepad;
 mod script;
 mod sync;
 use frame_transport::{FramePacket, FrameTransport};
@@ -172,6 +173,20 @@ enum Command {
         #[serde(default)]
         seq: Option<u64>,
         event: miko_automation::Event,
+    },
+    SyncGamepadLeader {
+        session: uuid::Uuid,
+        sequence: u64,
+        report: Option<[u8; 13]>,
+        #[serde(default)]
+        ended: bool,
+    },
+    SyncGamepad {
+        session: uuid::Uuid,
+        sequence: u64,
+        report: Option<[u8; 13]>,
+        #[serde(default)]
+        ended: bool,
     },
     SyncRelease,
 }
@@ -372,7 +387,36 @@ async fn watch_foreground_app(adb: std::path::PathBuf, serial: String) {
         {
             let text = String::from_utf8_lossy(&output.stdout);
             if let Some(package) = foreground_package(&text) {
-                eprintln!("MIKO_FOREGROUND:{}", json!({"package":package}));
+                let mut home = tokio::process::Command::new(&adb);
+                home.args([
+                    "-s",
+                    &serial,
+                    "shell",
+                    "cmd",
+                    "package",
+                    "resolve-activity",
+                    "--brief",
+                    "-a",
+                    "android.intent.action.MAIN",
+                    "-c",
+                    "android.intent.category.HOME",
+                ])
+                .kill_on_drop(true);
+                let launcher =
+                    match tokio::time::timeout(Duration::from_secs(3), home.output()).await {
+                        Ok(Ok(result)) if result.status.success() => {
+                            String::from_utf8_lossy(&result.stdout)
+                                .lines()
+                                .find_map(|line| {
+                                    line.trim().split_once('/').map(|(name, _)| name == package)
+                                })
+                        }
+                        _ => None,
+                    };
+                eprintln!(
+                    "MIKO_FOREGROUND:{}",
+                    json!({"package":package, "is_launcher":launcher})
+                );
             }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -519,6 +563,8 @@ fn fixture_reply(line: &str) -> Option<(&'static str, serde_json::Value)> {
             | Command::MappingHold { .. }
             | Command::SyncMode { .. }
             | Command::SyncInput { .. }
+            | Command::SyncGamepadLeader { .. }
+            | Command::SyncGamepad { .. }
             | Command::SyncRelease,
         ) => {
             return None;
@@ -630,6 +676,9 @@ struct BridgeInputs {
     input_lease: Option<String>,
     lease_release_failed: bool,
     mapping_holds: std::collections::HashSet<u16>,
+    native_gamepad: Option<native_gamepad::NativeGamepad>,
+    native_gamepad_suppressed: bool,
+    connect_info: ConnectInfo,
 }
 
 fn blocked_by_input_fault(command: &Command) -> bool {
@@ -642,19 +691,18 @@ fn blocked_by_input_fault(command: &Command) -> bool {
                 | Command::ScriptPlayStart { .. }
                 | Command::ScriptRecordStart
                 | Command::MappingHold { active: true, .. }
+                | Command::SyncGamepad { .. }
         )
 }
 
 impl BridgeInputs {
-    async fn acquire_input(&mut self, takeover: bool) -> Result<()> {
+    async fn acquire_input(&mut self, takeover: bool, gamepad_sync: bool) -> Result<()> {
         if self.input_lease.is_none() {
-            let result = self
-                .client
-                .call(
-                    "input.acquire",
-                    json!({"device":self.device,"takeover":takeover}),
-                )
-                .await?;
+            let mut parameters = json!({"device":self.device,"takeover":takeover});
+            if gamepad_sync {
+                parameters["gamepad_sync"] = json!(true);
+            }
+            let result = self.client.call("input.acquire", parameters).await?;
             let token = result["token"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("invalid input ownership reply"))?;
@@ -668,6 +716,7 @@ impl BridgeInputs {
             || self.state.has_held_inputs()
             || self.scripts.is_playing()
             || !self.mapping_holds.is_empty()
+            || self.native_gamepad.is_some()
         {
             return;
         }
@@ -692,6 +741,7 @@ impl BridgeInputs {
 
     async fn input_failure(&mut self, message: String) {
         self.input_faulted = true;
+        self.native_gamepad_suppressed = true;
         self.scripts.fail_recording(&message);
         let _ = self.state.release().await;
         self.follower_input = sync::FollowerInputArbiter::default();
@@ -703,6 +753,15 @@ impl BridgeInputs {
     }
 
     async fn release_before_handoff(&mut self) -> bool {
+        if let Some(pad) = self.native_gamepad.as_mut()
+            && let Err(error) = pad.stop().await
+        {
+            self.lease_release_failed = true;
+            self.input_failure(format!("Gamepad release failed: {error:#}"))
+                .await;
+            return false;
+        }
+        self.native_gamepad = None;
         match self.state.release().await {
             Ok(()) => true,
             Err(error) => {
@@ -736,6 +795,20 @@ impl BridgeInputs {
         if self.sync.ignores_user_input(&command) {
             return;
         }
+        if self.native_gamepad.is_some() && script::is_manual_takeover(&command) {
+            if !self.release_before_handoff().await {
+                return;
+            }
+            self.release_idle_lease().await;
+            if self.lease_release_failed {
+                return;
+            }
+            self.native_gamepad_suppressed = true;
+            eprintln!(
+                "MIKO_SYNC_STATUS:{}",
+                json!({"state":"gamepad_error","message":"Gamepad sync interrupted by local input"})
+            );
+        }
         let needs_input = script::is_direct_input(&command)
             || matches!(
                 command,
@@ -745,7 +818,7 @@ impl BridgeInputs {
             );
         let takeover = script::is_manual_takeover(&command)
             || matches!(command, Command::MappingHold { active: true, .. });
-        if needs_input && let Err(error) = self.acquire_input(takeover).await {
+        if needs_input && let Err(error) = self.acquire_input(takeover, false).await {
             self.input_faulted = true;
             eprintln!(
                 "MIKO_INPUT:{}",
@@ -798,6 +871,7 @@ impl BridgeInputs {
                     sync_text,
                     sync_tool_keys,
                 ) {
+                    self.native_gamepad_suppressed = false;
                     self.rejected_remote.clear();
                     if !self.release_before_handoff().await {
                         return;
@@ -807,6 +881,9 @@ impl BridgeInputs {
                 return;
             }
             Command::SyncInput { seq, event } => {
+                if self.native_gamepad.is_some() {
+                    return;
+                }
                 let rotation = self.rotation.load(Ordering::Relaxed);
                 if let Some(adapted) = self.sync.accept_follower_input(seq, &event, rotation) {
                     if self.rejected_remote.should_skip(&adapted) {
@@ -815,7 +892,7 @@ impl BridgeInputs {
                     if self.sync.is_unlocked_follower() && !self.follower_input.remote(&adapted) {
                         return;
                     }
-                    if let Err(error) = self.acquire_input(false).await {
+                    if let Err(error) = self.acquire_input(false, false).await {
                         self.rejected_remote.reject(&adapted);
                         self.follower_input = sync::FollowerInputArbiter::default();
                         self.input_faulted = true;
@@ -842,10 +919,104 @@ impl BridgeInputs {
                 }
                 return;
             }
+            Command::SyncGamepadLeader {
+                session,
+                sequence,
+                report,
+                ended,
+            } => {
+                self.sync
+                    .emit_leader_gamepad(session, sequence, report, ended);
+                return;
+            }
+            Command::SyncGamepad {
+                session,
+                sequence,
+                report,
+                ended,
+            } => {
+                if !self.sync.is_follower() || self.native_gamepad_suppressed {
+                    return;
+                }
+                if ended {
+                    if self
+                        .native_gamepad
+                        .as_ref()
+                        .is_some_and(|pad| pad.session == session)
+                    {
+                        let _ = self.release_before_handoff().await;
+                    }
+                    return;
+                }
+                let Some(report) = report else {
+                    return;
+                };
+                if self
+                    .native_gamepad
+                    .as_ref()
+                    .is_some_and(|pad| pad.session != session)
+                    && !self.release_before_handoff().await
+                {
+                    return;
+                }
+                if self.native_gamepad.is_none() {
+                    let local_pad = self
+                        .client
+                        .call("input.gamepad.get", json!({"device":self.device}))
+                        .await;
+                    if !matches!(local_pad, Ok(ref status) if status["connected"] == false && status["recovering"] != true && status["mode"] != "touch")
+                    {
+                        self.native_gamepad_suppressed = true;
+                        eprintln!(
+                            "MIKO_SYNC_STATUS:{}",
+                            json!({"state":"gamepad_error","message":"A controller is already bound to this device"})
+                        );
+                        return;
+                    }
+                    if self.state.has_held_inputs()
+                        || !self.mapping_holds.is_empty()
+                        || self.scripts.is_playing()
+                        || self.acquire_input(false, true).await.is_err()
+                    {
+                        self.native_gamepad_suppressed = true;
+                        eprintln!(
+                            "MIKO_SYNC_STATUS:{}",
+                            json!({"state":"gamepad_error","message":"Device input is busy"})
+                        );
+                        return;
+                    }
+                    match native_gamepad::NativeGamepad::start(&self.connect_info, session) {
+                        Ok(pad) => self.native_gamepad = Some(pad),
+                        Err(error) => {
+                            self.input_failure(format!("Gamepad registration failed: {error:#}"))
+                                .await;
+                            return;
+                        }
+                    }
+                    if let Some(pad) = self.native_gamepad.as_mut()
+                        && let Err(error) = pad.register().await
+                    {
+                        let _ = self.release_before_handoff().await;
+                        self.input_failure(format!("Gamepad registration failed: {error:#}"))
+                            .await;
+                        return;
+                    }
+                }
+                if let Some(pad) = self.native_gamepad.as_mut()
+                    && let Err(error) = pad.report(sequence, &report).await
+                {
+                    let _ = self.release_before_handoff().await;
+                    self.input_failure(format!("Gamepad input failed: {error:#}"))
+                        .await;
+                }
+                return;
+            }
             Command::SyncRelease => {
                 self.rejected_remote.clear();
                 if self.sync.is_active()
-                    && (!self.sync.is_unlocked_follower() || self.follower_input.remote_release())
+                    && (self.native_gamepad.is_some()
+                        || !self.sync.is_unlocked_follower()
+                        || self.follower_input.remote_release())
                 {
                     let _ = self.release_before_handoff().await;
                 }
@@ -1090,8 +1261,7 @@ impl SerialInput for BridgeInputs {
         self.release_idle_lease().await;
     }
     async fn release(&mut self) {
-        if let Err(error) = self.state.release().await {
-            eprintln!("Input release failed during shutdown: {error:#}");
+        if !self.release_before_handoff().await {
             return;
         }
         self.mapping_holds.clear();
@@ -1099,9 +1269,25 @@ impl SerialInput for BridgeInputs {
         self.release_idle_lease().await;
     }
     fn next_tick(&self) -> Option<Instant> {
-        self.scripts.next_tick()
+        match (
+            self.scripts.next_tick(),
+            self.native_gamepad
+                .as_ref()
+                .map(|pad| pad.last + Duration::from_secs(2)),
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
     async fn tick(&mut self, now: Instant) {
+        if self
+            .native_gamepad
+            .as_ref()
+            .is_some_and(|pad| now.duration_since(pad.last) >= Duration::from_secs(2))
+        {
+            let _ = self.release_before_handoff().await;
+            self.input_failure("Gamepad sync timed out".into()).await;
+        }
         let outcome = self.scripts.tick(now);
         let mut failure = None;
         for (offset, event) in outcome.events.into_iter().enumerate() {
@@ -1321,6 +1507,9 @@ async fn main() -> Result<()> {
         input_lease: None,
         lease_release_failed: false,
         mapping_holds: std::collections::HashSet::new(),
+        native_gamepad: None,
+        native_gamepad_suppressed: false,
+        connect_info: info.clone(),
     };
     let mut pump = FramePump {
         frames,

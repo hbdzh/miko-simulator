@@ -454,10 +454,19 @@ async fn main() -> Result<()> {
         )
         .await?,
     );
-    if let Ok(mut events) = client.subscribe(&["device.", "sync."]).await {
+    if let Ok(mut events) = client
+        .subscribe(&["device.", "sync.", "input.gamepad."])
+        .await
+    {
         tokio::spawn(async move {
-            while let Ok(event) = events.recv().await {
-                send(json!({"type":"device_event", "event":event}));
+            loop {
+                match events.recv().await {
+                    Ok(event) => send(json!({"type":"device_event", "event":event})),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        send(json!({"type":"gamepad_events_lost"}))
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
         });
     }
