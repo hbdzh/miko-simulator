@@ -82,6 +82,39 @@ async fn a_session_starts_reports_and_stops() {
 }
 
 #[tokio::test]
+async fn start_uses_current_orientation_for_both_displays() {
+    let h = Harness::start().await;
+    let mut c = h.client().await;
+    running(&mut c, "A").await;
+    running(&mut c, "B").await;
+    let portrait = c
+        .ok("sync.start", json!({"leader":"A", "followers":["B"]}))
+        .await;
+    c.ok("sync.stop", json!({})).await;
+    std::fs::write(
+        h.tmp.path().join("studio/platform-tools/adb"),
+        "#!/bin/sh\necho '  mCurrentOrientation=1'\n",
+    )
+    .unwrap();
+    let landscape = c
+        .ok("sync.start", json!({"leader":"A", "followers":["B"]}))
+        .await;
+    assert_eq!(
+        landscape["leader_display"]["width"],
+        portrait["leader_display"]["height"]
+    );
+    assert_eq!(
+        landscape["leader_display"]["height"],
+        portrait["leader_display"]["width"]
+    );
+    assert_eq!(
+        landscape["followers"][0]["display"],
+        landscape["leader_display"]
+    );
+    h.stop().await;
+}
+
+#[tokio::test]
 async fn start_validates_its_input() {
     let h = Harness::start().await;
     let mut c = h.client().await;

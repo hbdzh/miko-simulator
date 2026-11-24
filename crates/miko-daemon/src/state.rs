@@ -28,6 +28,76 @@ use miko_core::rpc::Event;
 /// after it either way.
 const STOP_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+// The emulator splits camera file names at whitespace even when its argv is
+// correctly quoted. A stable, private link also survives quick-boot saves.
+#[cfg(unix)]
+fn camera_link_dir(id: Uuid) -> PathBuf {
+    PathBuf::from("/tmp").join(format!("miko-camera-{id}"))
+}
+
+#[cfg(unix)]
+fn camera_launch_source(
+    id: Uuid,
+    side: &str,
+    source: &Option<String>,
+) -> MikoResult<Option<String>> {
+    use std::os::unix::fs::{DirBuilderExt, symlink};
+    let Some(value) = source else { return Ok(None) };
+    let Some((kind, path)) = value.split_once(':') else {
+        return Ok(Some(value.clone()));
+    };
+    if !matches!(kind, "imagefile" | "videofile") {
+        return Ok(Some(value.clone()));
+    }
+    let dir = camera_link_dir(id);
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(&dir) {
+        Ok(()) => (),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) => {}
+        Err(error) => {
+            return Err(MikoError::sdk(format!(
+                "cannot prepare camera path: {error}"
+            )));
+        }
+    }
+    let link = dir.join(side);
+    if let Err(error) = std::fs::remove_file(&link)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(MikoError::sdk(format!(
+            "cannot replace camera path: {error}"
+        )));
+    }
+    symlink(path, &link)
+        .map_err(|error| MikoError::sdk(format!("cannot prepare camera path: {error}")))?;
+    Ok(Some(format!("{kind}:{}", link.display())))
+}
+
+#[cfg(not(unix))]
+fn camera_launch_source(
+    _id: Uuid,
+    _side: &str,
+    source: &Option<String>,
+) -> MikoResult<Option<String>> {
+    Ok(source.clone())
+}
+
+#[cfg(unix)]
+fn clear_camera_links(id: Uuid) {
+    let dir = camera_link_dir(id);
+    if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+        let _ = std::fs::remove_file(dir.join("back"));
+        let _ = std::fs::remove_file(dir.join("front"));
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+#[cfg(not(unix))]
+fn clear_camera_links(_id: Uuid) {}
+
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
     pub paths: MikoPaths,
@@ -239,6 +309,7 @@ impl State {
         if cold_boot_persisted {
             self.clear_session_marker(&device);
         }
+        clear_camera_links(id);
         lock(&self.resumed).remove(&id);
         lock(&self.adopted).remove(&id);
         self.finish_footprint(id);
@@ -479,8 +550,15 @@ impl State {
         {
             if !miko_backend::valid_camera(cam) {
                 return Err(MikoError::usage(format!(
-                    "invalid camera {cam:?}: use emulated, virtualscene, none or webcamN"
+                    "invalid camera {cam:?}: use emulated, virtualscene, none, webcamN or a file source"
                 )));
+            }
+            if let Some(path) = cam
+                .strip_prefix("imagefile:")
+                .or_else(|| cam.strip_prefix("videofile:"))
+                && !std::path::Path::new(path).is_file()
+            {
+                return Err(MikoError::usage(format!("camera file is missing: {path}")));
             }
         }
         let resume = device
@@ -497,10 +575,18 @@ impl State {
             extra_args.extend(["-feature".into(), "VulkanSnapshots".into()]);
         }
         extra_args.extend(device.launch.extra_args.iter().cloned());
+        let camera_back = camera_launch_source(id, "back", &device.launch.camera_back)?;
+        let camera_front = match camera_launch_source(id, "front", &device.launch.camera_front) {
+            Ok(value) => value,
+            Err(error) => {
+                clear_camera_links(id);
+                return Err(error);
+            }
+        };
         let opts = LaunchOptions {
             ramdisk: device.launch.ramdisk.clone(),
-            camera_back: device.launch.camera_back.clone(),
-            camera_front: device.launch.camera_front.clone(),
+            camera_back,
+            camera_front,
             extra_args,
             gpu: device.launch.gpu.clone(),
             audio: device.launch.audio.unwrap_or(true),
@@ -535,6 +621,7 @@ impl State {
         let info = match self.backend.start(&spec, &opts, &progress, cancel).await {
             Ok(info) => info,
             Err(e) => {
+                clear_camera_links(id);
                 self.set_status(id, DeviceStatus::Stopped, Some(None));
                 self.emit("device.boot_failed", json!({ "device": id, "error": e }));
                 return Err(e);
@@ -708,6 +795,7 @@ impl State {
             me.finish_footprint(id);
             // Releases ports; the process is already gone.
             let _ = me.backend.stop(&info).await;
+            clear_camera_links(id);
             me.set_status(
                 id,
                 DeviceStatus::Crashed {
@@ -854,6 +942,7 @@ impl State {
                 self.watch_crash(id, info);
                 return Err(e);
             }
+            clear_camera_links(id);
             lock(&self.adopted).remove(&id);
             if cold_boot_persisted {
                 self.clear_session_marker(&current);
@@ -968,6 +1057,7 @@ impl DaemonContext for State {
             self.watch_crash(id, info);
             return Err(e);
         }
+        clear_camera_links(id);
         self.clear_session_marker(&current);
         self.finish_footprint(id);
         lock(&self.activity).remove(&id);

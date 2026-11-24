@@ -144,6 +144,22 @@ pub enum Cmd {
         #[arg(long)]
         android_id: Option<String>,
     },
+    /// Show or set camera sources for the next device start.
+    Camera {
+        device: String,
+        /// default, emulated, virtualscene, webcam0, webcam1, none, image or video.
+        #[arg(long)]
+        back: Option<String>,
+        /// default, emulated, webcam0, webcam1, none, image or video.
+        #[arg(long)]
+        front: Option<String>,
+        /// Absolute file path when --back is image or video.
+        #[arg(long)]
+        back_file: Option<PathBuf>,
+        /// Absolute file path when --front is image or video.
+        #[arg(long)]
+        front_file: Option<PathBuf>,
+    },
     /// Play an audio file as a device's microphone (WAV, or raw 16-bit PCM).
     Audio {
         #[command(subcommand)]

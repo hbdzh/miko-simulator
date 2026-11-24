@@ -100,6 +100,10 @@ pub fn valid_camera(v: &str) -> bool {
     matches!(v, "emulated" | "virtualscene" | "none")
         || v.strip_prefix("webcam")
             .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        || ["imagefile:", "videofile:"].iter().any(|prefix| {
+            v.strip_prefix(prefix)
+                .is_some_and(|p| std::path::Path::new(p).is_absolute())
+        })
 }
 
 pub fn default_gpu() -> &'static str {

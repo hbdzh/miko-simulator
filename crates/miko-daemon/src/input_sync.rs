@@ -123,7 +123,7 @@ impl Inner {
     async fn device_display(&self, device: &Device) -> Option<DisplaySize> {
         let avds = self.state.avds();
         let avd = device.avd.clone();
-        tokio::task::spawn_blocking(move || {
+        let mut size = tokio::task::spawn_blocking(move || {
             let config = avds.config(&avd).ok()?;
             let width: u32 = config.get("hw.lcd.width")?.parse().ok()?;
             let height: u32 = config.get("hw.lcd.height")?.parse().ok()?;
@@ -132,7 +132,20 @@ impl Inner {
         })
         .await
         .ok()
-        .flatten()
+        .flatten()?;
+        if let (Some(instance), Ok(adb_path)) =
+            (self.state.instance(device.id), self.state.adb_path())
+        {
+            let adb = miko_adb::Adb::new(adb_path)
+                .device(&instance.adb_serial)
+                .with_timeout(std::time::Duration::from_secs(3));
+            if let Ok(output) = adb.shell("dumpsys display").await
+                && crate::flow_device::display_orientation(&output).is_some_and(|r| r % 2 == 1)
+            {
+                std::mem::swap(&mut size.width, &mut size.height);
+            }
+        }
+        Some(size)
     }
 
     /// Runs `f` on the active session; publishes and returns the result.

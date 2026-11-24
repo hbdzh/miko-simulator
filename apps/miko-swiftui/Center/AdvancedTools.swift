@@ -645,11 +645,11 @@ struct AdvancedToolsView: View {
     private var fingerprintTools: some View {
         Group {
             DeviceToolActions {
-                Button(t("已注册手指", "Enrolled finger")) { call("fingerprint.touch",["finger":1]) }
-                Button(t("未注册手指", "Other finger")) { call("fingerprint.touch",["finger":9]) }
+                Button(t("指纹 1", "Finger 1")) { call("fingerprint.touch",["finger":1]) }
+                Button(t("指纹 9", "Finger 9")) { call("fingerprint.touch",["finger":9]) }
                 Button(t("抬起", "Lift")) { call("fingerprint.remove") }
             }
-            Text(t("需先在 Android 安全设置中注册指纹。", "Enroll a fingerprint in Android security settings first.")).font(.caption).foregroundStyle(WbColor.textSecondary)
+            Text(t("在 Android 设置中用指纹 1 注册；认证时使用未注册的编号可测试失败。抬起表示手指离开传感器。", "Enroll finger 1 in Android settings. Use an unenrolled number to test failure; Lift removes the finger from the sensor.")).font(.caption).foregroundStyle(WbColor.textSecondary)
         }
     }
 
@@ -661,10 +661,22 @@ struct AdvancedToolsView: View {
                         DeviceToolPopUp(label: t("后置摄像头", "Back camera"), identifier: "camera-back",
                                         options: cameraBackOptions, selection: $cameraEdits.draft.back).frame(width: 180)
                     }
+                    if ["image", "video"].contains(cameraEdits.draft.back) {
+                        LabeledContent(t("后置文件", "Back file")) {
+                            Text(cameraEdits.draft.backFile.isEmpty ? t("未选择", "Not selected") : URL(fileURLWithPath: cameraEdits.draft.backFile).lastPathComponent).lineLimit(1)
+                            Button(t("选择…", "Choose…")) { choose(cameraEdits.draft.back == "image" ? ["png", "jpg", "jpeg"] : ["mp4", "mov"]) { cameraEdits.draft.backFile = $0.path } }
+                        }
+                    }
                     Divider()
                     LabeledContent(t("前置摄像头", "Front camera")) {
                         DeviceToolPopUp(label: t("前置摄像头", "Front camera"), identifier: "camera-front",
                                         options: cameraFrontOptions, selection: $cameraEdits.draft.front).frame(width: 180)
+                    }
+                    if ["image", "video"].contains(cameraEdits.draft.front) {
+                        LabeledContent(t("前置文件", "Front file")) {
+                            Text(cameraEdits.draft.frontFile.isEmpty ? t("未选择", "Not selected") : URL(fileURLWithPath: cameraEdits.draft.frontFile).lastPathComponent).lineLimit(1)
+                            Button(t("选择…", "Choose…")) { choose(cameraEdits.draft.front == "image" ? ["png", "jpg", "jpeg"] : ["mp4", "mov"]) { cameraEdits.draft.frontFile = $0.path } }
+                        }
                     }
                 }
                 if cameraDirty {
@@ -719,6 +731,7 @@ struct AdvancedToolsView: View {
     private var cameraBackOptions: [(String, String)] {
         [("default", t("跟随设备默认值", "Device default")), ("emulated", t("模拟", "Emulated")), ("virtualscene", t("虚拟场景", "Virtual scene")),
          ("webcam0", t("Mac 摄像头 1", "Mac camera 1")), ("webcam1", t("Mac 摄像头 2", "Mac camera 2")),
+         ("image", t("图片文件", "Image file")), ("video", t("视频文件", "Video file")),
          ("none", t("禁用", "None"))]
     }
     private var cameraFrontOptions: [(String, String)] {
@@ -730,21 +743,22 @@ struct AdvancedToolsView: View {
                 message = t("摄像头配置格式无效。", "Invalid camera response.")
                 return
             }
-            guard cameraBackOptions.contains(where: { $0.0 == back }), cameraFrontOptions.contains(where: { $0.0 == front }) else {
+            let decoded = DeviceCameraDraft.decode(back: back, front: front)
+            guard cameraBackOptions.contains(where: { $0.0 == decoded.back }), cameraFrontOptions.contains(where: { $0.0 == decoded.front }) else {
                 cameraEdits = DeviceCameraEdits()
                 message = t("当前摄像头来源暂不受支持，配置未修改。", "The current camera source is unsupported. Its configuration was not changed.")
                 return
             }
-            cameraEdits.load(DeviceCameraDraft(back: back, front: front))
+            cameraEdits.load(decoded)
         }
     }
     private func applyCamera() {
         guard cameraDirty else { return }
         let submitted = cameraEdits.draft
-        call("camera.set", ["back": submitted.back, "front": submitted.front]) { value in
+        call("camera.set", ["back": submitted.back, "front": submitted.front, "back_file": submitted.backFile, "front_file": submitted.frontFile]) { value in
             let data = value as? [String: Any]
-            let stored = DeviceCameraDraft(back: data?["back"] as? String ?? submitted.back,
-                                           front: data?["front"] as? String ?? submitted.front)
+            let stored = DeviceCameraDraft.decode(back: data?["back"] as? String ?? submitted.back,
+                                                  front: data?["front"] as? String ?? submitted.front)
             cameraEdits.acknowledge(stored, submitted: submitted)
             message = t("摄像头已保存，下次启动设备时生效。", "Camera sources saved; they apply the next time the device starts.")
         }

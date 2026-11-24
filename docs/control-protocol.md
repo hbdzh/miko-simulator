@@ -274,13 +274,15 @@ Camera sources used at the next start
 
 #### `camera.set`
 
-Use the host webcam (or the emulated camera) at the next start · locks the device
+Set camera sources, including local images and videos, for the next start · locks the device
 
 | Param | Type | Required | Description |
 |---|---|---|---|
 | `device` | string | yes |  |
 | `back` | CameraSource |  |  |
 | `front` | CameraSource |  |  |
+| `back_file` | string |  | Absolute local image or video path when back is image or video. |
+| `front_file` | string |  | Absolute local image or video path when front is image or video. |
 
 ### `clipboard.*`
 
@@ -413,8 +415,8 @@ Rename a device or change its hardware (stopped) · locks the device
 | `agent_owned` | boolean |  |  |
 | `auto_hibernate_minutes` | integer |  | Hibernate this device after so many idle minutes (0 = never); `null` follows the `auto_hibernate_minutes` setting. |
 | `quick_boot` | boolean |  | Per-device quick boot; `null` follows the global setting. |
-| `camera_back` | string |  | Camera source for the next start: `default`, `none`, `emulated`, `webcamN`, or `virtualscene` (back camera only). |
-| `camera_front` | string |  | Front camera source for the next start: `default`, `none`, `emulated`, or `webcamN`. |
+| `camera_back` | string |  | Camera source for the next start: `default`, `none`, `emulated`, `webcamN`, `virtualscene` (back only), `imagefile:<absolute path>` or `videofile:<absolute path>`. |
+| `camera_front` | string |  | Front camera source for the next start: `default`, `none`, `emulated`, `webcamN`, `imagefile:<absolute path>` or `videofile:<absolute path>`. |
 
 #### `device.hibernate`
 
@@ -1413,6 +1415,7 @@ Snapshot warnings report low resources, incomplete or unclean sessions, and `sto
 | 0.1 (additive) | Input synchronizer (D45): `sync.start`, `sync.stop`, `sync.status`, `sync.add_follower`, `sync.remove_follower`, `sync.set_leader`, `sync.set_options` and `sync.report` manage one session in which a leader device's input is mirrored on running follower devices; events `sync.state` and `sync.follower_error`. No new error codes: `usage`, `not_found` and `busy` are used. The session ends when the leader stops, crashes, hibernates or is deleted, or no follower is left. See [sync.md](sync.md). |
 | 0.1 (additive) | `file.sync.start` gains optional `direction` (`one_way` default, or `bidirectional`); `SyncInfo` and `file.sync.synced` gain `direction`, `pulled`, `removed_local`, and `conflicts`; new `file.sync.resolve {id, path, resolution}` resolves bidirectional conflicts and `file.sync.conflict` reports active conflicts. |
 | 0.1 (additive/change) | `network.shaping.set` accepts optional `dns` and `dns_delay_ms`, and shaping is stored on `Device` and restored on boot. `identity.get/set`, `input.gamepad.*`, `file.sync.*`, and `file.flash` add device identifiers, controller forwarding, one-way folder sync and ZIP classification. `media.record` gains optional `audio` (default true) and reports whether an audio track was included (`audio`) and any valid audio packet was received (`audio_received`). File sync events are published under the `file.sync.` prefix. |
+| 0.1 (additive) | `camera.set` accepts `default`, `image` and `video` sources, with absolute local paths in `back_file` / `front_file`; `camera.get` reports file sources as `imagefile:<path>` or `videofile:<path>`. Changes apply on the next device start. |
 | 0.1 (additive) | `image.inventory` lists installed SDK image copies and their device references; destructive `image.remove` removes an unused image from a specified Miko-owned SDK. |
 | 0.1 (additive) | `sdk.license_details {packages}` returns each applicable licence text and its current `accepted` state without changing consent. Existing `sdk.licenses` continues to return only pending licences. |
 | 0.1 (fix) | `base.create` leaves the source's animation settings unchanged. `pool.get` disables animations on each clone after boot and before delivery; a clone that cannot be configured is removed and reported as a failure. |

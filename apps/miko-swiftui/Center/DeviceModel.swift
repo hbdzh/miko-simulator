@@ -532,6 +532,7 @@ final class CenterModel: ObservableObject {
                 if topic == "sync.state" {
                     let data = event["data"] as? [String:Any]
                     CenterSyncSession.apply(data?["session"], to: syncHub)
+                    reportCurrentSyncLeaderDisplay()
                     return
                 }
                 if topic == "sync.follower_error" {
@@ -1526,7 +1527,7 @@ final class CenterModel: ObservableObject {
                     self?.syncHub.releaseFollowers(from: id)
                 }
                 player.transport.onSyncDisplaySizeChanged = { [weak self] frameW, frameH in
-                    self?.reportSyncDisplayIfNeeded(id: id, frameWidth: frameW, frameHeight: frameH, lcdWidth: width, lcdHeight: height)
+                    self?.reportSyncDisplayIfNeeded(id: id, frameWidth: frameW, frameHeight: frameH)
                 }
                 player.transport.onSyncTakeOver = { [weak self] in self?.setSyncLeader(id) }
                 player.transport.onOpenSyncPanel = { [weak self] in self?.openSyncPanel() }
@@ -2016,11 +2017,10 @@ final class CenterModel: ObservableObject {
         guard closePlayerForStop(id) else { return }
         operation("device.stop", id: id, then: { [weak self] in self?.start(id) })
     }
-    private func reportSyncDisplayIfNeeded(id: String, frameWidth: Int, frameHeight: Int, lcdWidth: Int, lcdHeight: Int) {
+    private func reportSyncDisplayIfNeeded(id: String, frameWidth: Int, frameHeight: Int) {
         guard let session = syncHub.session,
-              frameWidth > 0, frameHeight > 0, lcdWidth > 0, lcdHeight > 0 else { return }
-        let rotated = (frameWidth > frameHeight) != (lcdWidth > lcdHeight)
-        let size = SyncDisplaySize(width: rotated ? lcdHeight : lcdWidth, height: rotated ? lcdWidth : lcdHeight)
+              frameWidth > 0, frameHeight > 0 else { return }
+        let size = SyncDisplaySize(width: frameWidth, height: frameHeight)
         if session.leader == id {
             guard session.leader_display != size else { return }
         } else if let follower = session.followers.first(where: { $0.device == id }) {
@@ -2032,6 +2032,11 @@ final class CenterModel: ObservableObject {
             "device": id,
             "display": ["width": size.width, "height": size.height],
         ]) { _ in }
+    }
+
+    func reportCurrentSyncLeaderDisplay() {
+        guard let id = syncHub.session?.leader, let transport = players[id]?.transport else { return }
+        reportSyncDisplayIfNeeded(id: id, frameWidth: transport.frameWidth, frameHeight: transport.frameHeight)
     }
 
     func estimateStorageMigration(to destination: String, completion: @escaping (Result<StorageEstimateInfo, Error>) -> Void) {

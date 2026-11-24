@@ -119,4 +119,7 @@ precondition(!cameras.hasChanges && cameras.saved == submittedCameras)
 cameras.draft.front = "webcam1"
 cameras.acknowledge(submittedCameras, submitted: submittedCameras)
 precondition(cameras.hasChanges && cameras.draft.front == "webcam1")
+let fileCameras = DeviceCameraDraft.decode(back: "imagefile:/tmp/a b.png", front: "videofile:/tmp/c.mp4")
+precondition(fileCameras.back == "image" && fileCameras.backFile == "/tmp/a b.png")
+precondition(fileCameras.front == "video" && fileCameras.frontFile == "/tmp/c.mp4")
 print("Camera edit state regressions passed")

@@ -166,10 +166,10 @@ pub struct EditParams {
     /// Per-device quick boot; `null` follows the global setting.
     #[serde(default, deserialize_with = "some_bool_or_null")]
     pub quick_boot: Option<Option<bool>>,
-    /// Camera source for the next start: `default`, `none`, `emulated`, `webcamN`, or `virtualscene` (back camera only).
+    /// Camera source for the next start: `default`, `none`, `emulated`, `webcamN`, `virtualscene` (back only), `imagefile:<absolute path>` or `videofile:<absolute path>`.
     #[serde(default)]
     pub camera_back: Option<String>,
-    /// Front camera source for the next start: `default`, `none`, `emulated`, or `webcamN`.
+    /// Front camera source for the next start: `default`, `none`, `emulated`, `webcamN`, `imagefile:<absolute path>` or `videofile:<absolute path>`.
     #[serde(default)]
     pub camera_front: Option<String>,
 }

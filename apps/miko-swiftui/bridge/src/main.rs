@@ -1841,6 +1841,29 @@ mod tests {
         assert_eq!(panel_point(1.0, 1.0, 720, 1280, 3), Some((719, 0)));
         assert_eq!(panel_point(-0.1, 0.0, 720, 1280, 0), None);
         assert_eq!(panel_point(f64::NAN, 0.0, 720, 1280, 0), None);
+        for (rotation, corners) in [
+            [(0, 0), (719, 0), (0, 1279), (719, 1279)],
+            [(719, 0), (719, 1279), (0, 0), (0, 1279)],
+            [(719, 1279), (0, 1279), (719, 0), (0, 0)],
+            [(0, 1279), (0, 0), (719, 1279), (719, 0)],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for ((x, y), expected) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
+                .into_iter()
+                .zip(corners)
+            {
+                assert_eq!(
+                    panel_point(x, y, 720, 1280, rotation as u32),
+                    Some(expected)
+                );
+            }
+            let (x, y) = panel_point(0.5, 0.5, 720, 1280, rotation as u32).unwrap();
+            assert!((359..=360).contains(&x) && (639..=640).contains(&y));
+            assert_eq!(panel_point(1.01, 0.5, 720, 1280, rotation as u32), None);
+            assert_eq!(panel_point(0.5, -0.01, 720, 1280, rotation as u32), None);
+        }
     }
     #[test]
     fn display_orientation_only_accepts_valid_logical_rotation() {

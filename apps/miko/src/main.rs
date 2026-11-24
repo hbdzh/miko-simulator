@@ -859,6 +859,30 @@ async fn dispatch(c: &Client, cmd: Cmd, out: Out) -> MikoResult<()> {
                 )
             });
         }
+        Cmd::Camera {
+            device,
+            back,
+            front,
+            back_file,
+            front_file,
+        } => {
+            let v = if back.is_none()
+                && front.is_none()
+                && back_file.is_none()
+                && front_file.is_none()
+            {
+                c.call("camera.get", json!({"device":device})).await?
+            } else {
+                c.call("camera.set", json!({"device":device,"back":back,"front":front,"back_file":back_file,"front_file":front_file})).await?
+            };
+            out.ok(&v, |v| {
+                format!(
+                    "Back: {}\nFront: {}",
+                    v["back"].as_str().unwrap_or("default"),
+                    v["front"].as_str().unwrap_or("default")
+                )
+            });
+        }
         Cmd::Identity { device, android_id } => {
             let v = match android_id {
                 None => c.call("identity.get", json!({ "device": device })).await?,

@@ -43,6 +43,8 @@
     { "name": "logcat_tail", "description": "Recent log lines, optionally filtered" },
     { "name": "proxy_set", "description": "Send the device's HTTP(S) traffic through Burp or mitmproxy on this Mac" },
     { "name": "proxy_clear", "description": "Remove the device's HTTP proxy" },
+    { "name": "camera_get", "description": "Read device camera sources" },
+    { "name": "camera_set", "description": "Set device camera sources" },
     { "name": "ca_cert_install", "description": "Trust Burp's or mitmproxy's CA as a system certificate on a Full-root device" },
     { "name": "sync_start", "description": "Start an input synchronizer session mirroring leader player input to followers" },
     { "name": "sync_stop", "description": "Stop the active input synchronizer session" },

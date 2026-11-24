@@ -117,6 +117,48 @@ async fn magisk_root_cycle_none_magisk_none() {
         networks.contains("AndroidWifi"),
         "saved networks: {networks}"
     );
+    call(&daemon, &ctx, "device.stop", json!({ "device": name })).await;
+    call(
+        &daemon,
+        &ctx,
+        "device.start",
+        json!({ "device": name, "cold_boot": true }),
+    )
+    .await;
+    let info = state.connect_info(d.id).await.unwrap();
+    let adb = Adb::new(info.adb_path).device(info.adb_serial);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let wifi = adb.shell("cmd wifi status").await.unwrap_or_default();
+        if wifi.contains("connected to \"AndroidWifi\"") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Wi-Fi status: {wifi}"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    if std::env::var_os("MIKO_TEST_EXTERNAL_NETWORK").is_some() {
+        if let Some(curl) = std::env::var_os("MIKO_TEST_CURL") {
+            adb.push(
+                std::path::Path::new(&curl),
+                "/data/local/tmp/miko-test-curl",
+            )
+            .await
+            .unwrap();
+            adb.shell("chmod 755 /data/local/tmp/miko-test-curl")
+                .await
+                .unwrap();
+        }
+        let (status, output) = adb.clone()
+            .with_timeout(std::time::Duration::from_secs(30))
+            .shell_status("if [ -x /data/local/tmp/miko-test-curl ]; then echo tool=test-curl; /data/local/tmp/miko-test-curl -fsS --max-time 15 -o /dev/null http://connectivitycheck.gstatic.com/generate_204; elif command -v curl >/dev/null; then echo tool=curl; curl -fsS --max-time 15 -o /dev/null http://connectivitycheck.gstatic.com/generate_204; else echo no-curl; exit 127; fi")
+            .await
+            .unwrap();
+        assert_eq!(status, 0, "external network: {output}");
+        println!("external network: {output}");
+    }
     let prefs =
         "/data/user_de/0/com.topjohnwu.magisk/shared_prefs/com.topjohnwu.magisk_preferences.xml";
 

@@ -25,6 +25,8 @@ fn one() -> u8 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CameraSource {
+    /// Use the device default.
+    Default,
     /// The emulator's animated test pattern.
     Emulated,
     /// The 3D virtual scene (back camera only).
@@ -33,16 +35,23 @@ pub enum CameraSource {
     Webcam0,
     /// The Mac's second webcam.
     Webcam1,
+    /// Use a local image file.
+    Image,
+    /// Use a local video file.
+    Video,
     None,
 }
 
 impl CameraSource {
     fn arg(self) -> &'static str {
         match self {
+            CameraSource::Default => "default",
             CameraSource::Emulated => "emulated",
             CameraSource::Virtualscene => "virtualscene",
             CameraSource::Webcam0 => "webcam0",
             CameraSource::Webcam1 => "webcam1",
+            CameraSource::Image => "imagefile",
+            CameraSource::Video => "videofile",
             CameraSource::None => "none",
         }
     }
@@ -56,6 +65,34 @@ pub struct CameraParams {
     pub back: Option<CameraSource>,
     #[serde(default)]
     pub front: Option<CameraSource>,
+    /// Absolute local image or video path when back is image or video.
+    pub back_file: Option<String>,
+    /// Absolute local image or video path when front is image or video.
+    pub front_file: Option<String>,
+}
+
+fn camera_value(
+    source: Option<CameraSource>,
+    file: Option<String>,
+) -> MikoResult<Option<Option<String>>> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    match source {
+        CameraSource::Default => Ok(Some(None)),
+        CameraSource::Image | CameraSource::Video => {
+            let path =
+                file.ok_or_else(|| MikoError::usage("camera image or video requires a file path"))?;
+            if !std::path::Path::new(&path).is_absolute() || !std::path::Path::new(&path).is_file()
+            {
+                return Err(MikoError::usage(format!(
+                    "camera file is not an existing absolute file: {path}"
+                )));
+            }
+            Ok(Some(Some(format!("{}:{path}", source.arg()))))
+        }
+        _ => Ok(Some(Some(source.arg().to_string()))),
+    }
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -68,7 +105,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new::<DeviceParams>("camera.get", "Camera sources used at the next start"),
         CommandSpec::new::<CameraParams>(
             "camera.set",
-            "Use the host webcam (or the emulated camera) at the next start",
+            "Set camera sources, including local images and videos, for the next start",
         )
         .locks_device(),
     ]
@@ -150,7 +187,8 @@ pub async fn call(ctx: &CallCtx, method: &str, params: Value) -> MikoResult<Valu
                 return Err(MikoError::usage("the virtual scene is a back camera only"));
             }
             let d = ctx.daemon.device(&p.device).await?;
-            let (back, front) = (p.back, p.front);
+            let back = camera_value(p.back, p.back_file)?;
+            let front = camera_value(p.front, p.front_file)?;
             let d = ctx
                 .daemon
                 .update_device(
@@ -158,18 +196,18 @@ pub async fn call(ctx: &CallCtx, method: &str, params: Value) -> MikoResult<Valu
                     Box::new(move |d: &mut Device| {
                         if let Some(b) = back {
                             remove_camera_args(&mut d.launch.extra_args, "-camera-back");
-                            d.launch.camera_back = Some(b.arg().into());
+                            d.launch.camera_back = b;
                         }
                         if let Some(f) = front {
                             remove_camera_args(&mut d.launch.extra_args, "-camera-front");
-                            d.launch.camera_front = Some(f.arg().into());
+                            d.launch.camera_front = f;
                         }
                     }),
                 )
                 .await?;
             Ok(json!({
-                "back": camera_of(&d, "-camera-back"),
-                "front": camera_of(&d, "-camera-front"),
+                "back": camera_of(&d, "-camera-back").unwrap_or_else(|| "default".into()),
+                "front": camera_of(&d, "-camera-front").unwrap_or_else(|| "default".into()),
                 "applies": "next start",
             }))
         }
@@ -216,5 +254,21 @@ mod tests {
         ];
         remove_camera_args(&mut args, "-camera-back");
         assert_eq!(args, ["-no-audio", "-camera-front", "emulated"]);
+    }
+
+    #[test]
+    fn camera_files_require_existing_absolute_paths_and_keep_spaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("camera image.png");
+        std::fs::write(&path, b"image").unwrap();
+        let value =
+            camera_value(Some(CameraSource::Image), Some(path.display().to_string())).unwrap();
+        assert_eq!(value, Some(Some(format!("imagefile:{}", path.display()))));
+        assert!(camera_value(Some(CameraSource::Video), Some("relative.mp4".into())).is_err());
+        assert!(camera_value(Some(CameraSource::Video), None).is_err());
+        assert_eq!(
+            camera_value(Some(CameraSource::Default), None).unwrap(),
+            Some(None)
+        );
     }
 }

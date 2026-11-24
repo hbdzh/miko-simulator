@@ -74,6 +74,20 @@ async fn proxy_set_and_clear() {
     assert_eq!(env.shell("settings get global http_proxy").trim(), ":0");
     let got = env.call("network.proxy.get", json!({})).await;
     assert!(got["proxy"].is_null(), "{got}");
+
+    for cold_boot in [true, false] {
+        env.call(
+            "network.proxy.set",
+            json!({ "host": "10.0.2.2", "port": 8080 }),
+        )
+        .await;
+        env.call("network.proxy.clear", json!({})).await;
+        env.call("device.stop", json!({})).await;
+        env.run("device.start", json!({ "cold_boot": cold_boot }))
+            .await;
+        let got = env.call("network.proxy.get", json!({})).await;
+        assert!(got["proxy"].is_null(), "cold_boot={cold_boot}: {got}");
+    }
     env.stop().await;
 }
 

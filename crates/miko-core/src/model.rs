@@ -324,7 +324,7 @@ pub struct LaunchPrefs {
     /// Per-device quick-boot override. None follows the global setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quick_boot: Option<bool>,
-    /// `-camera-back`: `emulated`, `virtualscene`, `none` or `webcamN` (R7, D36).
+    /// `-camera-back`: `emulated`, `virtualscene`, `none`, `webcamN`, `imagefile:<path>` or `videofile:<path>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub camera_back: Option<String>,
     /// `-camera-front`: same values.

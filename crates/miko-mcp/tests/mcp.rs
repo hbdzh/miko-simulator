@@ -40,6 +40,8 @@ async fn tools_are_listed_with_annotations() {
         "logcat_tail",
         "proxy_set",
         "proxy_clear",
+        "camera_get",
+        "camera_set",
         "ca_cert_install",
     ] {
         assert!(names.contains(&want), "{want} missing from {names:?}");

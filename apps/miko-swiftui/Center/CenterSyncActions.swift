@@ -34,6 +34,7 @@ extension CenterModel {
             switch result {
             case .success(let value):
                 CenterSyncSession.apply(value, to: self.syncHub)
+                self.reportCurrentSyncLeaderDisplay()
                 // Ensure the leader has an open player window so input flows immediately.
                 if self.players[leader] == nil {
                     self.openGame(leader)
@@ -69,6 +70,7 @@ extension CenterModel {
             switch result {
             case .success(let value):
                 CenterSyncSession.apply(value, to: self.syncHub)
+                self.reportCurrentSyncLeaderDisplay()
             case .failure(let error):
                 self.showError(self.readable(error))
             }

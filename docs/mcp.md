@@ -58,6 +58,8 @@ TTL 租约从克隆设备交付时开始，daemon 重启后保留 ID 和截止�
 
 其他操作通过 `command_run` 调用。例如，使用 Mac 上的 WAV 作为设备麦克风输入：`command_run {command: "audio.inject", params: {device, path, loop?}, timeout_s: 5}` 在播放期间返回任务，`command_run {command: "audio.stop", params: {device}}` 停止播放。
 
+`camera_get {device}` 读取下次启动使用的摄像头来源；`camera_set {device, back?, back_file?, front?, front_file?}` 设置来源。选择 `image` 或 `video` 时，提供对应的本机绝对文件路径；`default` 恢复默认值。
+
 网络模拟可通过 `network.shaping.get` 和 `network.shaping.set {device, loss_pct?, dns?, dns_delay_ms?}` 调用，需要 Shell Root 或 Full Root 及 netem 支持；设置会在启动后恢复。`identity.get/set`、`input.gamepad.*`、`file.sync.*` 和 `file.flash` 也可通过 `command_run` 调用。文件夹同步支持默认的 `one_way`（主机删除会移除此前同步的文件，保留设备独有文件）和 `bidirectional`（双向同步增删，通过 `file.sync.resolve` 处理冲突）。接口与 qdisc 限制见[设备内辅助程序](on-device-helper.md)。
 
 各工具带有 `readOnlyHint`、`destructiveHint`、`idempotentHint` 和 `openWorldHint` 标记。miko 错误以 `isError: true` 和结构化 `{code, message, data}` 返回；错误码见[控制协议](control-protocol.md)。例如，智能体可以在 `not_found` 后启动已停止的设备。

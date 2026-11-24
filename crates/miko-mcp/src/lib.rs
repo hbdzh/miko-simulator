@@ -467,6 +467,20 @@ struct ProxyArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct CameraArgs {
+    device: String,
+    /// default, emulated, virtualscene (back only), webcam0, webcam1, none, image or video.
+    back: Option<String>,
+    /// default, emulated, webcam0, webcam1, none, image or video.
+    front: Option<String>,
+    /// Absolute local file for an image or video back camera.
+    back_file: Option<String>,
+    /// Absolute local file for an image or video front camera.
+    front_file: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CaCertArgs {
     /// A running Full-root (Magisk) device.
     device: String,
@@ -653,6 +667,16 @@ impl MikoMcp {
             tool::<DeviceArgs>(
                 "proxy_clear",
                 "Remove a running device's HTTP proxy.",
+                idempotent(),
+            ),
+            tool::<DeviceArgs>(
+                "camera_get",
+                "Read camera sources for the next device start.",
+                read_only(),
+            ),
+            tool::<CameraArgs>(
+                "camera_set",
+                "Set camera sources for the next device start, including local image and video files.",
                 idempotent(),
             ),
             tool::<CaCertArgs>(
@@ -1060,6 +1084,18 @@ impl MikoMcp {
                         .call("network.proxy.clear", json!({ "device": a.device }))
                         .await?,
                 ))
+            }
+            "camera_get" => {
+                let a: DeviceArgs = parse(args)?;
+                Ok(ok_json(
+                    self.client
+                        .call("camera.get", json!({"device": a.device}))
+                        .await?,
+                ))
+            }
+            "camera_set" => {
+                let a: CameraArgs = parse(args)?;
+                Ok(ok_json(self.client.call("camera.set", json!({"device":a.device,"back":a.back,"front":a.front,"back_file":a.back_file,"front_file":a.front_file})).await?))
             }
             "ca_cert_install" => {
                 let a: CaCertArgs = parse(args)?;

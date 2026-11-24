@@ -55,6 +55,7 @@ miko --json device start Phone --timeout 300 || exit $?
 | `pool get <base> [--ttl 2h] [--timeout s]`, `pool release <lease\|device>`, `pool renew <lease> [--ttl 2h]`, `pool ls` | 为智能体和 CI 提供一次性基底克隆（D42）。`get` 恢复写时复制克隆并输出序列号；租约从交付开始按 `--ttl` 计时（默认 2 小时），到期后 daemon 停止并删除克隆。daemon 重启后保留租约 ID 和期限。内存预算已满时 `get` 最多等待 `--timeout`（默认 120 秒），然后返回 9。存在租约时 daemon 保持运行（D4）。 |
 | `cert install <name> <file>`, `cert list <name>`, `cert verify <name>`, `cert remove <name> <cert>\|--all` | 管理完整 Root 设备系统证书库中的 CA 证书（Root 引擎，`root.cacert.*`）；安装和删除会重启设备。详见 docs/root.md。 |
 | `proxy set <name> [host:]port`, `proxy clear <name>`, `proxy show <name>` | 设置、清除或查看设备全局 HTTP 代理（工具组件，`network.proxy.*`）；主机默认 `10.0.2.2`，即本机 Mac。 |
+| `camera <name> [--back SOURCE] [--back-file PATH] [--front SOURCE] [--front-file PATH]` | 查看或设置下次启动使用的摄像头来源。`image`、`video` 需提供对应的本机绝对文件路径；`default` 恢复设备默认值。 |
 | `audio inject <name> <file> [--loop] [--rate Hz [--channels 1\|2]] [--no-wait]`, `audio stop <name>` | 将 WAV 作为设备麦克风播放（工具组件，`audio.*`）；`--rate` 将文件作为无头 16 位 PCM 读取。见[麦克风](#microphone)。 |
 | `jobs list [--all]`, `jobs wait <job>`, `jobs cancel <job>` | 查看、等待或取消长时间运行的任务。 |
 | `commands` | 列出全部协议命令（与 GUI 和 MCP 所见相同）。 |

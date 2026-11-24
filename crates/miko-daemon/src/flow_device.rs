@@ -442,7 +442,7 @@ async fn wait_script_interval(
     FlowDevice::sleep(interval, cancel).await
 }
 
-fn display_orientation(output: &str) -> Option<u32> {
+pub(crate) fn display_orientation(output: &str) -> Option<u32> {
     output.lines().find_map(|line| {
         line.trim()
             .strip_prefix("mCurrentOrientation=")?
