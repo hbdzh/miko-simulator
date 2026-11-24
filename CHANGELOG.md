@@ -1,5 +1,87 @@
 # Changelog
 
+## [0.14.0](https://github.com/hbdzh/miko-simulator/compare/v0.13.1...v0.14.0) (2026-11-24)
+
+
+### Features
+
+* **automation:** add the operation-recording script library ([b826340](https://github.com/hbdzh/miko-simulator/commit/b826340180f5ee3beab5d7379d6e4922d5e24249))
+* **bridge:** expose app inspection and uninstall to the player ([9d05063](https://github.com/hbdzh/miko-simulator/commit/9d0506313ccf2961fd29d43a5ba6d6ef867e7706))
+* bundle Magisk for offline full root ([8afa02e](https://github.com/hbdzh/miko-simulator/commit/8afa02ea5dad7c8dc424cb324b4d13697db69b94))
+* **center:** consolidate native device management and tools ([4a03a09](https://github.com/hbdzh/miko-simulator/commit/4a03a098c4f7f544a7ee39abf003a0b7b091bb14))
+* **center:** make device details an on-demand inspector ([19d6af6](https://github.com/hbdzh/miko-simulator/commit/19d6af6aea98a73b1265a5ae05fb740cbe97c4c4))
+* **center:** refine device card and list layout ([6ae5f5c](https://github.com/hbdzh/miko-simulator/commit/6ae5f5c4a095cce27cfa3e7273777e1d9d48915e))
+* **center:** refine device management and native tools ([871f6d0](https://github.com/hbdzh/miko-simulator/commit/871f6d030e33e58142baa1512ba1c532d35f1baa))
+* **center:** refine device management and native tools ([95abdae](https://github.com/hbdzh/miko-simulator/commit/95abdae0ff5fb8f68af48d6f65cfbd69bfd48762))
+* **core:** extend rooted device pools and network simulation ([38cc062](https://github.com/hbdzh/miko-simulator/commit/38cc062cc55841fee2bd51bb7018af66a2c329af))
+* **daemon,widgets,root:** integrate network shaping, identity, gamepad, flash and audio recording ([d3eedbc](https://github.com/hbdzh/miko-simulator/commit/d3eedbc9cd071f57e2638ee7ee8d0b926f167c41))
+* **daemon:** manage images and validate quick boot saves ([5f67ae4](https://github.com/hbdzh/miko-simulator/commit/5f67ae43ad6cd04c97f6666a7ace556993f3aad0))
+* **gui:** add an installable SwiftUI test package ([ad96cc0](https://github.com/hbdzh/miko-simulator/commit/ad96cc02e6e6621d8b89b587de5d9ebf72b1f5a9))
+* **gui:** add SwiftUI prototype ([b46a2f3](https://github.com/hbdzh/miko-simulator/commit/b46a2f32da6002d589b99c1c7aa4a1541850915a))
+* **gui:** add the player operation-recording window and HUD ([36f35e5](https://github.com/hbdzh/miko-simulator/commit/36f35e519054428f86408e00a4ce4a63ee8d47d3))
+* **gui:** adopt the refreshed palette and shared design kit ([8b93795](https://github.com/hbdzh/miko-simulator/commit/8b937958fe976b3d08c47df68495a1c7103626a9))
+* **gui:** choose the SDK install location in setup ([0c22527](https://github.com/hbdzh/miko-simulator/commit/0c225276be81d8663ab14b01c9f89b80cd33343a))
+* **gui:** finish the token migration and resolve the bundled fonts ([0a6ab34](https://github.com/hbdzh/miko-simulator/commit/0a6ab34a52d01e24b26cab9414f5ac44456cf4ba))
+* **gui:** generate and apply the Workbench design tokens ([9e59b75](https://github.com/hbdzh/miko-simulator/commit/9e59b75cc8a0755c838fe47420457369b37114de))
+* **gui:** improve key mapping and device management ([ed45037](https://github.com/hbdzh/miko-simulator/commit/ed4503795cd4ddc05169d648273f7d36ecb7be54))
+* **gui:** improve setup, panels and settings ([8015314](https://github.com/hbdzh/miko-simulator/commit/8015314b8e0a27d1504d5a56d2731c91fc88c297))
+* **gui:** keyboard reachability and basic accessibility ([30279e3](https://github.com/hbdzh/miko-simulator/commit/30279e3af4a8448df6ded54eac8f0ca0c8bcb5fe))
+* **gui:** native menus, single instance and compact multi-window layout ([dbec801](https://github.com/hbdzh/miko-simulator/commit/dbec801cf0d631e9125a0c4a651b0909517b03eb))
+* **gui:** player window states, gestures, shortcuts and app uninstall ([dff2601](https://github.com/hbdzh/miko-simulator/commit/dff2601efc73d4228cb7905f849e8570418cd1c2))
+* **gui:** reconnect, task centre, command palette and shortcuts ([ec8c063](https://github.com/hbdzh/miko-simulator/commit/ec8c063dd09f5001369c71af56a153be4026285a))
+* **gui:** refine device center and player workflows ([a26e002](https://github.com/hbdzh/miko-simulator/commit/a26e00219b84b647678a6c2d89febe385218481f))
+* **gui:** refine device center and simulator windows ([119693f](https://github.com/hbdzh/miko-simulator/commit/119693f6a7f163657a686deba40892ec6fa18b0d))
+* **gui:** refresh the device centre, settings and sheets ([f60535d](https://github.com/hbdzh/miko-simulator/commit/f60535dd9c5eaa9e6c142f702f8472f170da5907))
+* **gui:** root timeline, snapshot dialogs and advanced tools ([ba69547](https://github.com/hbdzh/miko-simulator/commit/ba69547fd3c4e3e305e2daebdf4f965e853c12b3))
+* **player-bridge:** record and replay operation recordings ([53a503d](https://github.com/hbdzh/miko-simulator/commit/53a503d0cef7c7e3aa982c00dd75c6f20cbde3d2))
+* **player:** drop the shortcuts and uninstall sidebar buttons ([4cf2721](https://github.com/hbdzh/miko-simulator/commit/4cf272151b7388088c7abe96779de23ce9c1eb23))
+* **player:** move advanced tools into device settings ([e2b3c47](https://github.com/hbdzh/miko-simulator/commit/e2b3c47f68b740741ec7a71993ff8c4b1d6233f3))
+* **player:** refine the emulator window chrome ([0df285a](https://github.com/hbdzh/miko-simulator/commit/0df285a8aa55001bbd8e089e08c2b18f6f0a1fcf))
+* **player:** remove the Logcat strip from the device window ([0c06fe9](https://github.com/hbdzh/miko-simulator/commit/0c06fe9c53bd967fe00a898598879aefbd6cc5e6))
+* prepare miko simulator 0.10.0 ([ab07ca0](https://github.com/hbdzh/miko-simulator/commit/ab07ca05030701d6d4a7fbcaa9676bd360816561))
+* **release:** default to the SwiftUI centre and keep the Slint fallback ([2b92a8d](https://github.com/hbdzh/miko-simulator/commit/2b92a8d7e9ce82da55077389bd81787eab691fe4))
+* rename desktop application to miko simulator ([d72ea24](https://github.com/hbdzh/miko-simulator/commit/d72ea245e98cab473acba5c63f71eafd2b986e92))
+* require bundled emulator runtime ([c948c60](https://github.com/hbdzh/miko-simulator/commit/c948c605550716d6863cc450d4a28590b96dba99))
+* **sdk:** allow a custom writable SDK install root ([6bec82d](https://github.com/hbdzh/miko-simulator/commit/6bec82de805d6599bfc53a1c9e2185028890f3dc))
+* **sync,gui:** add bidirectional folder sync and dedicated sync panel ([e80c7b4](https://github.com/hbdzh/miko-simulator/commit/e80c7b4bf1526002bec82bf54a28561916bdb8df))
+* 增强手柄映射与设备界面，升级至 0.13.0 ([b9a8417](https://github.com/hbdzh/miko-simulator/commit/b9a8417cf99fafe2002a6c520e9febef9cab544e))
+* 完善多设备管理与界面自动化，升级至 0.12.0 ([0adf786](https://github.com/hbdzh/miko-simulator/commit/0adf7865aa88a09a06bf53820a56c10d56060c15))
+* 支持摄像头文件输入并修复横屏同步，升级至 0.13.1 ([b242d8a](https://github.com/hbdzh/miko-simulator/commit/b242d8a32b1b3d3f10e7d231278af0a65c5332cf))
+* 更新设备管理并准备 0.11.0 版本 ([a12bbde](https://github.com/hbdzh/miko-simulator/commit/a12bbde2e57af96a860bd1449b21e4da9095efe8))
+
+
+### Bug Fixes
+
+* **bridge:** satisfy clippy in the diagnostics test ([e7f8a1f](https://github.com/hbdzh/miko-simulator/commit/e7f8a1f100c0c2ccbb7c835f63a86e9e48222196))
+* **center:** support older macOS SDKs ([6e08a96](https://github.com/hbdzh/miko-simulator/commit/6e08a9624fd34409e8a96b3a1bcc28c9588ab915))
+* **core:** improve device lifecycle and cancellation ([975fd38](https://github.com/hbdzh/miko-simulator/commit/975fd3833fdecf2a3594e454be767825834c1cbd))
+* correct release artifact paths and audit runtime ([907c647](https://github.com/hbdzh/miko-simulator/commit/907c6471ef0538c746763a55683f1a635f4ce1a2))
+* **gui:** classify root patch failures from the error text ([6283a29](https://github.com/hbdzh/miko-simulator/commit/6283a290a2049c22b180bafc8ce7fcdcf37dada1))
+* **gui:** close the English-mode localization leaks ([ed5ac9e](https://github.com/hbdzh/miko-simulator/commit/ed5ac9e7d524f1008ab2fd755b7f8aa8eb5b0624))
+* **gui:** isolate input RPCs from screenshot transport flow control ([c8f7dab](https://github.com/hbdzh/miko-simulator/commit/c8f7dab144f7d88a047e330d86cd8a8442747337))
+* **gui:** make the device list selection and rows native ([94ed32c](https://github.com/hbdzh/miko-simulator/commit/94ed32c101911465758167273a88b4a6b98be9d2))
+* **gui:** pass clippy for the SwiftUI bridge ([5a4d8eb](https://github.com/hbdzh/miko-simulator/commit/5a4d8eba7ac4a9abd447d190e716458c518b2ef2))
+* **gui:** refine native windows and verify device deletion ([7fab010](https://github.com/hbdzh/miko-simulator/commit/7fab01047e111253a54510c92eedba3be98928ec))
+* **gui:** restore native macOS button styles ([b32b04f](https://github.com/hbdzh/miko-simulator/commit/b32b04f392837e1993dba291a5d62e25e370d409))
+* **gui:** restore native settings sidebar selection and clean up the command palette ([60c9f96](https://github.com/hbdzh/miko-simulator/commit/60c9f9653a98e1dcd5cec7c3daf514f6508a8790))
+* **gui:** show the detected external SDK, not the Jidr install root ([cf3d05e](https://github.com/hbdzh/miko-simulator/commit/cf3d05efb11398e6f1658c1ee51ba30a74e964f0))
+* **gui:** simplify empty library and restore app branding ([443fe25](https://github.com/hbdzh/miko-simulator/commit/443fe259bf46cecb0b7b3d0d931c649d45742ab3))
+* **gui:** update remaining product names ([0303d04](https://github.com/hbdzh/miko-simulator/commit/0303d0411fcd8e2fec537000561810b2180888fb))
+* **packaging:** include stopped-device artwork in app bundles ([0cf7f52](https://github.com/hbdzh/miko-simulator/commit/0cf7f52761d8e3d25d11e8b62c02902525bfd8a0))
+* **perf:** preserve failed probes and await isolated cleanup ([07172b7](https://github.com/hbdzh/miko-simulator/commit/07172b7c04b8232bd1e8d74add0a52893e03beb1))
+* **root:** extract ramdisks from Android boot images ([dad2045](https://github.com/hbdzh/miko-simulator/commit/dad20452b0cb8301411e3a2e0805f78947cdf73f))
+* **sdk:** improve migration integrity checks ([18b1722](https://github.com/hbdzh/miko-simulator/commit/18b17221d995e4efa504bb0c1503136bde29576e))
+* **widgets:** reject incomplete snapshots ([e60bc90](https://github.com/hbdzh/miko-simulator/commit/e60bc905816597d4025396c2eec1efc52d332a9a))
+
+
+### Performance Improvements
+
+* **center:** cache loaded images and trim frame-header allocations ([b5a79df](https://github.com/hbdzh/miko-simulator/commit/b5a79dff74b447030663e1fe6f18f017366422c6))
+* **center:** coalesce device refreshes and parse off the main thread ([8cd0e0d](https://github.com/hbdzh/miko-simulator/commit/8cd0e0dd861fb1689dd91113a5df046a275eddaa))
+* **gui:** schedule input independently of frame reception ([53073ae](https://github.com/hbdzh/miko-simulator/commit/53073ae1ae0a2810933e6053ec3e32aa8ecc9eea))
+* **gui:** share frame buffers and skip work under backpressure ([b314318](https://github.com/hbdzh/miko-simulator/commit/b314318cbeaa9cbdca84f7db82623e52e280e87b))
+* **player:** skip frame image work while the window is hidden ([a4fd3fd](https://github.com/hbdzh/miko-simulator/commit/a4fd3fda5283967540c54c3447c0808f389fbac3))
+
 ## 0.13.1 — miko 模拟器 (2026-11-24)
 
 ### 新增
